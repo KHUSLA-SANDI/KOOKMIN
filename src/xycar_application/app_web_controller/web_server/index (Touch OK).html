@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>F1Tenth 스마트 컨트롤러</title>
+    <script src="https://cdn.jsdelivr.net/npm/roslib@1.1.0/build/roslib.min.js"></script>
+    <style>
+        body { margin: 0; text-align: center; background-color: #f4f4f4; }
+        h1 { color: #333; }
+        .touch-container { position: absolute; width: 100%; height: 100%; top: 0; left: 0; display: flex; }
+        .touch-area { flex: 1; height: 100%; touch-action: none; }
+        .left { background: rgba(0, 0, 255, 0.1); }
+        .right { background: rgba(255, 0, 0, 0.2); }
+    </style>
+</head>
+<body>
+    <h1>F1Tenth 스마트 컨트롤러</h1>
+    <p>왼손: 속도 조절 (위쪽=100, 아래쪽=-100), 오른손: 조향 (왼쪽=-100, 오른쪽=100)</p>
+    
+    <div class="touch-container">
+        <div class="touch-area left"></div>
+        <div class="touch-area right"></div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            // ✅ WebSocket 연결
+            let ros = new ROSLIB.Ros({ url: "ws://192.168.5.190:9090" });
+
+            ros.on("connection", function() { console.log("✅ WebSocket 연결 성공!"); });
+            ros.on("error", function(error) { console.error("❌ WebSocket 오류:", error); });
+            ros.on("close", function() { console.log("🔴 WebSocket 연결 종료"); });
+
+            // ✅ /xycar_motor 토픽 생성
+            let xycarMotor = new ROSLIB.Topic({
+                ros: ros,
+                name: "/xycar_motor",
+                messageType: "xycar_msgs/msg/XycarMotor"
+            });
+
+            let speed = 0, angle = 0;
+            let screenCenterX = window.innerWidth / 2;
+            let screenHeight = window.innerHeight;
+
+            // ✅ 창 크기 변경 시 값 업데이트
+            window.addEventListener("resize", function() {
+                screenCenterX = window.innerWidth / 2;
+                screenHeight = window.innerHeight;
+            });
+
+            document.addEventListener("touchmove", function(event) {
+                event.preventDefault();
+                let leftTouch = null, rightTouch = null;
+
+                for (let touch of event.touches) {
+                    if (touch.clientX < screenCenterX) {
+                        leftTouch = touch; // 왼쪽 화면 터치
+                    } else {
+                        rightTouch = touch; // 오른쪽 화면 터치
+                    }
+                }
+
+                if (leftTouch) {
+                    let normY = 1 - (leftTouch.clientY / screenHeight); // 위가 +100, 아래가 -100
+                    speed = (normY * 200) - 100;
+                }
+
+                if (rightTouch) {
+                    let normX = ((rightTouch.clientX - screenCenterX) / (screenCenterX)) * 2 - 1; // -1.0 ~ 1.0
+                    angle = normX * 100; // -100 ~ 100으로 변환
+                }
+
+                console.log(`📱 속도: ${speed.toFixed(2)}, 조향: ${angle.toFixed(2)}`);
+
+                // ✅ xycar_motor 메시지 생성 및 발행
+                let motorMsg = new ROSLIB.Message({
+                    header: { stamp: { sec: 0, nanosec: 0 }, frame_id: "" },
+                    angle: angle,
+                    speed: speed
+                });
+                xycarMotor.publish(motorMsg);
+            });
+
+            document.addEventListener("touchend", function() {
+                speed = 0;
+                angle = 0;
+                let motorMsg = new ROSLIB.Message({
+                    header: { stamp: { sec: 0, nanosec: 0 }, frame_id: "" },
+                    angle: 0,
+                    speed: 0
+                });
+                xycarMotor.publish(motorMsg); // ✅ 수정된 부분
+                console.log("🛑 터치 종료 - 차량 정지");
+            });
+        });
+    </script>
+
+</body>
+</html>
+

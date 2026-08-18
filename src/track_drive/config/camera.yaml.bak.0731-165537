@@ -1,0 +1,54 @@
+# tools/ground_fit.py 로 맞춘 값 (0731-165329)
+# intrinsics_calibrated=false — 왜곡보정을 쓰지 않고
+#   H 를 원본(왜곡 있는) 픽셀에 직접 건다.
+# H: 원본 픽셀 -> 지면 미터 (x전방/y좌), 원점 = 라이다
+D:
+- -0.361976
+- 0.11051
+- 0.001014
+- 0.000505
+- 0.0
+H:
+- - -1.4364672708435355e-05
+  - -0.0007116795793715851
+  - 1.327520966057641
+- - -0.001144906495001068
+  - 3.497737509888084e-05
+  - 1.0871486636229404
+- - 0.00017848155161061675
+  - 0.005679375060479959
+  - -2.6115386543838475
+K:
+- - 438.783367
+  - 0.0
+  - 305.593336
+- - 0.0
+  - 437.302876
+  - 243.738352
+- - 0.0
+  - 0.0
+  - 1.0
+calibrated: false
+h_alpha: 0.0
+h_calibrated: true
+h_frame: lidar_frame
+h_grid_origin:
+- 0.0
+- 0.0
+h_grid_pitch_m: 0.453333
+h_lidar_offset_x: 0.1
+h_model: plumb_bob
+h_phys:
+  fx: 873.0055173669999
+  grid_x0: 0.45
+  grid_y0: 0.0
+  height: 0.2
+  pitch_deg: 7.2000000000000135
+  roll_deg: -1.7999999999999998
+  yaw_deg: -0.4000000000000001
+h_source: tools/ground_fit.py 물리값 수동 튜닝 (왜곡보정 미사용, 원본 픽셀 기준 H)
+image_height: 1080
+image_width: 1920
+intrinsics_calibrated: false
+intrinsics_source: tools/import_camera_info.py (file:/home/xytron/.ros/camera_info/default_cam.yaml)
+model: plumb_bob

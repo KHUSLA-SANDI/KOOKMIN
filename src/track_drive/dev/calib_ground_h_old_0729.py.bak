@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""바닥 호모그래피 H 캘리브 — undistort 이미지 픽셀 → 차량좌표(m) (독립 CLI, ROS 불필요).
+
+역할: camera.yaml 의 model/K/D 로 undistort 한 이미지 위에서 바닥 기준점을 클릭하고,
+      각 점의 실측 차량좌표(x전방/y좌, m)를 콘솔로 받아 cv2.findHomography 로
+      H(픽셀→차량좌표)를 계산. 재투영 오차 출력 후 camera.yaml 의 H 갱신.
+입력: --image 바닥 기준점이 보이는 사진, --camera camera.yaml (model/K/D 필요),
+      비대화 모드는 --points CSV (한 줄에 u,v,x,y — u,v 는 undistort 픽셀).
+출력: 콘솔에 H/점별 오차/RMS(m). --save 시 camera.yaml 의 H 갱신 + calibrated 재계산.
+예선 대비 변경점: 신규 도구 (예선 H 는 시뮬 tf_static 기반 자동 산출이었음).
+      undistort 는 lib/bev.py 의 Undistorter 를 그대로 불러 쓴다(모델 분기 포함) —
+      주행 노드와 undistort 가 1픽셀이라도 다르면 여기서 잡은 H 가 어긋난다.
+
+사용법:
+  # 대화 모드 — 클릭 → 콘솔에 "x y" 입력 반복, q 로 종료 후 계산
+  python3 calib_ground_h.py --image ground.jpg --camera ../config/camera.yaml --save
+  # A4 사각형 모드 — 네 꼭짓점만 클릭하면 4개 대응점 자동 생성 (아래 참고)
+  python3 calib_ground_h.py --image ground.jpg --camera ../config/camera.yaml \
+      --rect --rect-size 0.210 0.297 --rect-origin 1.00 0.00 \
+      --points a4_pts.csv --append --save
+  # 비대화 모드 — 측정값 CSV 재사용 (u,v,x,y / # 주석 허용)
+  python3 calib_ground_h.py --image ground.jpg --camera ../config/camera.yaml \
+      --points pts.csv --save
+  # 누적 CSV 위에 개별 점을 클릭으로 더 얹기 (--click 이 비대화 모드를 덮어씀)
+  python3 calib_ground_h.py --image ground.jpg --camera ../config/camera.yaml \
+      --click --points pts.csv --append --save
+  --save [경로] : 경로 생략 시 --camera 파일에 저장.
+
+A4 용지를 마커로 쓰는 법 (권장 — 줄자 실측을 최소화):
+  A4(210x297mm) 를 바닥에 놓고 네 꼭짓점을 클릭 → 각 꼭짓점의 실측 (x,y) 입력.
+  여러 장을 전방 0.5~2.5m 에 흩어 놓을 것.
+  - 용지의 긴 변(297mm)을 전방(x축)과 나란히, 짧은 변(210mm)을 좌우(y축)와 나란히.
+    반대로 눕혔다면 --rect-size 0.297 0.210 으로 뒤집어 준다.
+  - 용지가 들뜨면 안 된다(테이프로 고정). H 는 z=0 평면 가정이다.
+  - 전방 한 곳에 몰아 놓으면 원거리 오차가 커진다 — 좌/우/근/원으로 흩을 것.
+
+--rect 모드 (편의 모드):
+  사각형 네 꼭짓점을 아래 순서로 클릭하면, 실제 크기(--rect-size)와 근단 중앙의
+  지면좌표(--rect-origin)로부터 4개 대응점을 자동 생성한다. 꼭짓점마다 줄자를
+  대지 않아도 된다.
+    클릭 순서: 1)근단 좌  2)근단 우  3)원단 우  4)원단 좌   ("근단" = 차에 가까운 변)
+  사각형 하나를 끝낼 때마다 콘솔이 그 용지의 근단 중앙 좌표를 묻는다(첫 장은
+  --rect-origin 이 기본값). 한 이미지 안에서 여러 장을 이어서 찍을 수 있다.
+  --points 파일과 --append 를 같이 주면 새 대응점을 CSV 에 누적해, 다른 이미지로
+  다시 돌려도 이전 점들과 합쳐 H 를 계산한다.
+
+원거리 점은 --rect 로 못 잡는다 (실측 기하):
+  카메라가 지면에서 ~0.2m 높이에 거의 수평으로 달려 있어, 바닥 한 점의 화면 행 v 는
+  전방거리 x 에 대해 v ≈ cy + fy*h/x 로 급격히 포화한다. A4 를 2.5m 앞에 놓으면
+  화면에서 세로 3px / 면적 86px² 밖에 안 돼 MIN_RECT_AREA_PX 에 걸려 거부된다.
+  → A4 사각형은 0.4~1.2m 에만 쓰고, 1.5m 밖은 --click 으로 개별 점(테이프 십자 등)을
+    찍어 같은 CSV 에 --append 하는 게 맞다.
+
+좌표/규약:
+  - 차량좌표 = lidar_frame: x 전방+, y 좌+ (단위 m). 예) 앞 1.2m 오른쪽 0.3m → "1.2 -0.3"
+  - H 는 undistort 된 이미지 픽셀 기준이고, 그 픽셀 좌표계는 new_K 가 정한다.
+    fisheye 는 new_K=K 지만 plumb_bob 은 new_K != K 다
+    (cv2.getOptimalNewCameraMatrix(K, D, size, alpha), 기본 alpha 는 lib/bev.py 값).
+    그래서 H 를 저장할 때 그때 쓴 new_K 와 alpha 도 camera.yaml 에 같이 적는다 —
+    런타임이 bev.check_new_K_match() 로 좌표계 일치를 검증한다.
+  - K/D 가 미캘리브(단위행렬)면 undistort 를 건너뛰고 경고 —
+    calib_camera.py 또는 import_camera_info.py 를 먼저.
+  - 왜곡 모델(plumb_bob/fisheye)·K/D·alpha·이미지 크기 중 하나라도 바뀌면 new_K 가
+    달라져 기존 H 는 무효다. 그 경우 이 도구를 반드시 다시 돌릴 것.
+  - 점 4개 이상 필요. 한 직선 위 점들만 찍으면 H 퇴화 — 전후/좌우로 퍼뜨릴 것.
+"""
+
+import argparse
+import datetime
+import importlib.util
+import inspect
+import os
+import re
+import sys
+
+import cv2
+import numpy as np
+import yaml
+
+WIN = "calib_ground_h"
+MIN_POINTS = 4          # findHomography 최소 점 수
+RMS_WARN_M = 0.05       # 재투영 RMS 가 이보다 크면 경고 (5cm)
+MODELS = ("plumb_bob", "fisheye")
+A4_W_M, A4_L_M = 0.210, 0.297   # A4 짧은 변(좌우) / 긴 변(전후)
+MIN_RECT_AREA_PX = 200.0        # 클릭한 사각형이 이보다 작으면 오클릭 취급
+ALPHA_FALLBACK = 0.0            # lib/bev.py 를 못 읽을 때의 alpha 기본값
+
+
+# ======================== camera.yaml 로드/병합 저장 (calib_camera.py 와 동일 규약) ========================
+
+def _load_yaml(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def _flag(data, key):
+    """부분 캘리브 플래그. 구버전 파일(플래그 없음)은 calibrated 값으로 간주."""
+    if key in data:
+        return bool(data[key])
+    return bool(data.get("calibrated", False))
+
+
+def _save_camera_yaml(path, data, tool_name):
+    """기존 키 보존 + 지정 순서로 기록. (주의: 기존 파일의 주석은 사라짐)"""
+    order = ["calibrated", "intrinsics_calibrated", "h_calibrated", "model",
+             "image_width", "image_height", "K", "D", "new_K", "H"]
+    out = {k: data[k] for k in order if k in data}
+    for k, v in data.items():
+        if k not in out:
+            out[k] = v
+    header = (
+        "# 실차 카메라 캘리브 파일 — track_drive.lib.bev.load_camera_config() 가 읽는다.\n"
+        "# %s 가 %s 에 갱신.\n"
+        "# calibrated: K/D(내부)와 H(바닥) 둘 다 완료 시에만 true (부분 플래그는 아래 참고)\n"
+        "# model: plumb_bob(일반/광각, D 5개) | fisheye(등거리 어안, D 4개)\n"
+        "# K/D: 내부 파라미터.  new_K: undistort 결과 픽셀 좌표계를 정의하는 행렬.\n"
+        "# H: undistort(new_K 기준) 이미지 픽셀 → lidar 미터 (x전방/y좌).\n"
+        "#    new_K 가 바뀌면 H 는 통째로 무효 — bev.check_new_K_match() 가 대조한다.\n"
+        % (tool_name, datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header)
+        yaml.safe_dump(out, f, sort_keys=False, default_flow_style=None,
+                       allow_unicode=True)
+    print("저장: %s" % path)
+
+
+def _load_camera(path):
+    """camera.yaml 에서 model/K/D 를 읽는다 (calibrated 값과 무관하게 원본 사용)."""
+    data = _load_yaml(path)
+    if not data:
+        sys.exit("camera.yaml 읽기 실패: %s" % path)
+    try:
+        K = np.asarray(data["K"], np.float64).reshape(3, 3)
+        D = np.asarray(data["D"], np.float64).reshape(-1)
+    except (KeyError, TypeError, ValueError):
+        sys.exit("camera.yaml 에 K/D 없음/형식 오류: %s" % path)
+
+    model = str(data.get("model", "")).strip().lower()
+    if model not in MODELS:
+        # 구버전 파일(model 키 없음): D 길이로 추정 (fisheye 4개 / plumb_bob 5개 이상)
+        model = "fisheye" if D.size == 4 else "plumb_bob"
+        print("[안내] camera.yaml 에 model 키 없음 — D 계수 %d개를 보고 '%s' 로 추정."
+              % (D.size, model))
+        print("        calib_camera.py / import_camera_info.py 로 model 을 명시할 것.")
+    return K, D, model
+
+
+# ======================== undistort (lib/bev.py 규약과 반드시 일치) ========================
+
+_BEV_MEMO = []   # _import_bev 1회 로드 캐시
+
+
+def _import_bev():
+    """lib/bev.py 를 파일 경로로 로드한다 (tools/ 는 ROS 패키지 밖이라 일반 import 불가).
+
+    bev 는 rclpy 미의존(numpy/cv2/yaml 만)이라 CLI 도구에서 그대로 쓸 수 있다.
+    """
+    if _BEV_MEMO:
+        return _BEV_MEMO[0]
+    mod = None
+    path = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "track_drive", "lib", "bev.py"))
+    if os.path.isfile(path):
+        try:
+            spec = importlib.util.spec_from_file_location("_track_drive_bev", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:  # 로드 실패해도 도구는 폴백으로 계속 굴러가야 한다
+            print("[안내] lib/bev.py 로드 실패 (%s)" % e)
+            mod = None
+    _BEV_MEMO.append(mod)
+    return mod
+
+
+def _default_alpha():
+    """lib/bev.UNDISTORT_ALPHA_DEFAULT 를 따라간다 (주행 노드와 new_K 를 맞추기 위함)."""
+    bev = _import_bev()
+    try:
+        return float(getattr(bev, "UNDISTORT_ALPHA_DEFAULT", ALPHA_FALLBACK))
+    except (TypeError, ValueError):
+        return ALPHA_FALLBACK
+
+
+class _FallbackUndistorter:
+    """lib/bev.Undistorter 를 못 쓸 때의 동일 규약 대체본.
+
+    new_K 규약도 그대로 따라간다: fisheye → new_K=K,
+    plumb_bob → cv2.getOptimalNewCameraMatrix(K, D, size, alpha).
+    """
+
+    def __init__(self, K, D, size, model, alpha):
+        self.enabled = False
+        self.model = model
+        self.alpha = float(alpha)
+        self.new_K = np.asarray(K, np.float64)
+        try:
+            K_m = np.asarray(K, np.float64).reshape(3, 3)
+            D_m = np.asarray(D, np.float64).reshape(-1)
+            wh = (int(size[0]), int(size[1]))
+            if model == "fisheye":
+                D_m = np.concatenate([D_m, np.zeros(max(0, 4 - D_m.size))])[:4]
+                nk = K_m.copy()
+                self._map1, self._map2 = cv2.fisheye.initUndistortRectifyMap(
+                    K_m, D_m.reshape(4, 1), np.eye(3), nk, wh, cv2.CV_16SC2)
+            else:
+                D_m = np.concatenate([D_m, np.zeros(max(0, 5 - D_m.size))])
+                nk, _roi = cv2.getOptimalNewCameraMatrix(K_m, D_m, wh, self.alpha)
+                nk = np.asarray(nk, np.float64).reshape(3, 3)
+                self._map1, self._map2 = cv2.initUndistortRectifyMap(
+                    K_m, D_m, np.eye(3), nk, wh, cv2.CV_16SC2)
+            self.new_K = nk
+            self.enabled = True
+        except (cv2.error, TypeError, ValueError, IndexError):
+            self.enabled = False
+
+    def apply(self, bgr):
+        if not self.enabled or bgr is None:
+            return bgr
+        return cv2.remap(bgr, self._map1, self._map2, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT)
+
+
+def _make_undistorter(K, D, model, size, alpha):
+    """가능하면 lib/bev.Undistorter 를 그대로 쓴다 (주행 노드와 동일 픽셀 보장)."""
+    bev = _import_bev()
+    if bev is not None and hasattr(bev, "Undistorter"):
+        try:
+            params = inspect.signature(bev.Undistorter.__init__).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "model" in params:
+            kw = {"calibrated": True, "model": model}
+            if "alpha" in params:
+                kw["alpha"] = alpha
+            return bev.Undistorter(K, D, size, **kw), "lib/bev.py"
+        if model == "fisheye":
+            return bev.Undistorter(K, D, size, calibrated=True), "lib/bev.py (구버전)"
+        print("[경고] lib/bev.py 의 Undistorter 가 모델 분기를 지원하지 않는다(fisheye 전용).")
+        print("        model=%s 는 로컬 폴백으로 처리한다 — lib/bev.py 를 먼저 갱신할 것."
+              % model)
+        print("        (주행 노드가 다른 undistort 를 쓰면 여기서 잡은 H 가 어긋난다)")
+    return _FallbackUndistorter(K, D, size, model, alpha), "로컬 폴백"
+
+
+def _undistort(img, K, D, model, alpha):
+    """undistort 적용. 반환 (이미지, undistorter) — undistorter 가 None 이면 원본 픽셀 기준."""
+    if np.allclose(K, np.eye(3)) or not np.any(D):
+        print("[경고] K/D 미캘리브(단위행렬/0) — undistort 생략, 원본(raw) 픽셀 기준 H 가 됨.")
+        print("        calib_camera.py 또는 import_camera_info.py 를 먼저 돌릴 것.")
+        return img, None
+    h, w = img.shape[:2]
+    und, src = _make_undistorter(K, D, model, (w, h), alpha)
+    if not getattr(und, "enabled", False):
+        print("[경고] undistort 맵 생성 실패 (model=%s, K/D 형식 확인) — "
+              "원본 픽셀 기준 H 가 됨." % model)
+        return img, None
+    nk = np.asarray(und.new_K, np.float64).reshape(3, 3)
+    print("undistort: model=%s, 구현=%s, D %d개, alpha=%.2f"
+          % (model, src, np.size(D), alpha))
+    print("  new_K fx,fy,cx,cy = %.3f %.3f %.3f %.3f  (H 는 이 좌표계 기준 — "
+          "camera.yaml 의 new_K 로 저장된다)"
+          % (nk[0, 0], nk[1, 1], nk[0, 2], nk[1, 2]))
+    if model != "fisheye" and not np.allclose(nk, np.asarray(K, np.float64).reshape(3, 3)):
+        print("  ※ plumb_bob 은 new_K != K 다 (getOptimalNewCameraMatrix(alpha=%.2f)). "
+              "alpha 가 달라지면 H 가 무효." % alpha)
+    return und.apply(img), und
+
+
+# ======================== 점 수집: CSV ========================
+
+def _load_points_csv(path):
+    """CSV: 한 줄에 u,v,x,y (쉼표/공백 구분, # 주석·빈 줄 허용)."""
+    pts = []
+    with open(path, "r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            vals = re.split(r"[,\s]+", s)
+            if len(vals) != 4:
+                sys.exit("%s %d행: u,v,x,y 4개 값 필요: %r" % (path, ln, s))
+            try:
+                u, v, x, y = (float(t) for t in vals)
+            except ValueError:
+                sys.exit("%s %d행: 숫자 변환 실패: %r" % (path, ln, s))
+            pts.append([u, v, x, y])
+    return pts
+
+
+def _append_points_csv(path, pts, note):
+    """새로 만든 대응점을 CSV 에 이어 쓴다 (--append). 다음 실행에서 --points 로 재사용."""
+    new_file = not os.path.isfile(path)
+    with open(path, "a", encoding="utf-8") as f:
+        if new_file:
+            f.write("# calib_ground_h.py 누적 대응점 — u,v,x,y\n")
+            f.write("# u,v = undistort 이미지 픽셀 / x,y = lidar_frame m (x전방+, y좌+)\n")
+        f.write("# %s  (%s)\n"
+                % (note, datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+        for u, v, x, y in pts:
+            f.write("%.2f,%.2f,%.4f,%.4f\n" % (u, v, x, y))
+    print("누적 저장: %s (+%d점)" % (path, len(pts)))
+
+
+# ======================== 점 수집: 대화 모드 ========================
+
+def _draw_points(base, pts, hint=None):
+    disp = base.copy()
+    for i, (u, v, x, y) in enumerate(pts):
+        c = (int(round(u)), int(round(v)))
+        cv2.drawMarker(disp, c, (0, 0, 255), cv2.MARKER_CROSS, 16, 2)
+        cv2.putText(disp, "%d(%.2f,%.2f)" % (i + 1, x, y),
+                    (c[0] + 8, c[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (0, 0, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(disp, (0, 0), (disp.shape[1], 26), (0, 0, 0), -1)
+    if hint is None:
+        hint = "click ground point | [u] undo  [q] done (%d pts)" % len(pts)
+    cv2.putText(disp, hint, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (0, 255, 0), 1, cv2.LINE_AA)
+    return disp
+
+
+def _collect_interactive(base, base_pts=()):
+    """클릭 → 콘솔에 실측 차량좌표 입력. q/ESC 종료, u 마지막 점 취소.
+
+    base_pts (CSV 에서 이미 읽은 점들) 는 배경에 회색으로 깔아 참고용으로만 보여준다.
+    [u] 취소는 이번 실행에서 새로 찍은 점에만 적용된다.
+    """
+    if base_pts:
+        # 기존 점을 배경에 한 번만 그려 둔다 (새 점과 헷갈리지 않게 회색 + 작은 마커)
+        base = base.copy()
+        for u, v, x, y in base_pts:
+            c = (int(round(u)), int(round(v)))
+            cv2.drawMarker(base, c, (160, 160, 160), cv2.MARKER_TILTED_CROSS, 10, 1)
+        print("[안내] 기존 CSV %d점은 회색으로 표시된다 (취소 불가 — 참고용)."
+              % len(base_pts))
+    print("\n[안내] 이미지에서 바닥 기준점 클릭 → 콘솔에 실측 'x y' (m) 입력.")
+    print("  x=전방+, y=좌+ (lidar_frame). 예) 앞1.2m 오른쪽0.3m → 1.2 -0.3")
+    print("  키: [u] 마지막 점 취소 / [q]·[ESC] 입력 종료 (%d점 이상)" % MIN_POINTS)
+    print("  팁: 한 직선 위 점만 찍으면 H 퇴화 — 전후·좌우로 퍼뜨릴 것.")
+    print("  팁: 꼭짓점마다 줄자 대기 번거로우면 --rect (A4 사각형) 모드를 쓸 것.\n")
+
+    pts = []      # 확정 [u, v, x, y]
+    pending = []  # 클릭됐지만 좌표 미입력
+
+    def on_mouse(event, mx, my, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            pending.append((mx, my))
+
+    cv2.namedWindow(WIN)
+    cv2.setMouseCallback(WIN, on_mouse)
+    while True:
+        cv2.imshow(WIN, _draw_points(base, pts))
+        key = cv2.waitKey(30) & 0xFF
+        while pending:
+            u, v = pending.pop(0)
+            tmp = _draw_points(base, pts)
+            cv2.drawMarker(tmp, (u, v), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+            cv2.imshow(WIN, tmp)
+            cv2.waitKey(1)  # 콘솔 입력 동안 창 갱신 멈춤 — 정상
+            s = input("점%d 픽셀(%d,%d) 의 차량좌표 x y (m, 빈 입력=이 점 취소): "
+                      % (len(pts) + 1, u, v)).strip()
+            if not s:
+                print("  → 취소")
+                continue
+            vals = re.split(r"[,\s]+", s)
+            try:
+                x, y = float(vals[0]), float(vals[1])
+            except (ValueError, IndexError):
+                print("  → 형식 오류 (예: 1.2 -0.3) — 이 점 취소")
+                continue
+            pts.append([float(u), float(v), x, y])
+        if key == ord("u") and pts:
+            rm = pts.pop()
+            print("취소: 점%d (%.0f,%.0f)→(%.2f,%.2f)" % (len(pts) + 1, *rm))
+        elif key in (ord("q"), 27):
+            break
+    return pts
+
+
+# ======================== 점 수집: --rect (A4 사각형) 모드 ========================
+
+def _rect_corner_xy(origin, w_m, l_m):
+    """근단 중앙 (x0,y0) + 사각형 크기 → 클릭 순서대로의 지면좌표 4개.
+
+    클릭 순서 = 1)근단 좌  2)근단 우  3)원단 우  4)원단 좌.
+    y 는 좌+ 이므로 '좌' 가 +w/2, '우' 가 -w/2. '원단' 은 x 가 +l_m.
+    """
+    x0, y0 = origin
+    half = w_m / 2.0
+    return [(x0, y0 + half), (x0, y0 - half),
+            (x0 + l_m, y0 - half), (x0 + l_m, y0 + half)]
+
+
+def _ask_origin(default):
+    """이번 사각형의 근단 중앙 지면좌표를 콘솔에서 받는다. None = 이 사각형 취소."""
+    if default is not None:
+        s = input("  이 사각형 근단(가까운) 변 중앙의 차량좌표 x y "
+                  "[엔터=%.3f %.3f, c=취소]: " % default).strip()
+        if not s:
+            return default
+    else:
+        s = input("  이 사각형 근단(가까운) 변 중앙의 차량좌표 x y [c=취소]: ").strip()
+    if s.lower() == "c":
+        return None
+    vals = re.split(r"[,\s]+", s)
+    try:
+        return (float(vals[0]), float(vals[1]))
+    except (ValueError, IndexError):
+        print("  → 형식 오류 (예: 1.20 -0.30) — 이 사각형 취소")
+        return None
+
+
+def _draw_rect_progress(base, pts, cur, n_rect):
+    disp = _draw_points(
+        base, pts,
+        hint="rect: click 4 corners (near-L, near-R, far-R, far-L) | "
+             "[u] undo  [q] done (%d rect, %d pts)" % (n_rect, len(pts)))
+    labels = ("nL", "nR", "fR", "fL")
+    for i, (u, v) in enumerate(cur):
+        cv2.circle(disp, (u, v), 5, (0, 255, 255), -1)
+        cv2.putText(disp, labels[i], (u + 7, v - 7), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 255, 255), 1, cv2.LINE_AA)
+        if i > 0:
+            cv2.line(disp, cur[i - 1], (u, v), (0, 255, 255), 1, cv2.LINE_AA)
+    return disp
+
+
+def _collect_rects(base, rect_size, rect_origin, base_pts):
+    """사각형(A4) 네 꼭짓점 클릭 → 대응점 4개 자동 생성. 여러 장 반복 가능."""
+    w_m, l_m = rect_size
+    print("\n[안내] --rect 모드: 사각형 네 꼭짓점을 아래 순서로 클릭.")
+    print("  1) 근단 좌   2) 근단 우   3) 원단 우   4) 원단 좌   (근단 = 차에 가까운 변)")
+    print("  사각형 크기: 좌우 %.3fm x 전후 %.3fm (--rect-size)" % (w_m, l_m))
+    print("  4점을 찍을 때마다 콘솔이 그 사각형의 근단 중앙 좌표를 묻는다.")
+    print("  키: [u] 되돌리기(현재 클릭 → 직전 사각형) / [q]·[ESC] 종료")
+    print("  팁: A4 는 전방 0.5~2.5m 에 좌/우/근/원으로 흩어 놓을 것.\n")
+
+    new_pts = []    # 이번 실행에서 생성한 [u,v,x,y]
+    cur = []        # 현재 사각형의 클릭 (u,v)
+    clicks = []     # 마우스 큐
+    next_origin = rect_origin
+
+    def on_mouse(event, mx, my, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicks.append((mx, my))
+
+    cv2.namedWindow(WIN)
+    cv2.setMouseCallback(WIN, on_mouse)
+    while True:
+        shown = base_pts + new_pts
+        cv2.imshow(WIN, _draw_rect_progress(base, shown, cur, len(new_pts) // 4))
+        key = cv2.waitKey(30) & 0xFF
+        while clicks:
+            cur.append(clicks.pop(0))
+            if len(cur) < 4:
+                continue
+            cv2.imshow(WIN, _draw_rect_progress(
+                base, base_pts + new_pts, cur, len(new_pts) // 4))
+            cv2.waitKey(1)  # 콘솔 입력 동안 창 갱신 멈춤 — 정상
+            quad = np.asarray(cur, np.float32).reshape(-1, 1, 2)
+            area = abs(cv2.contourArea(quad))
+            if area < MIN_RECT_AREA_PX:
+                print("  → 사각형 면적 %.0f px² 로 너무 작음/퇴화 — 이 사각형 취소" % area)
+                cur = []
+                continue
+            origin = _ask_origin(next_origin)
+            if origin is None:
+                print("  → 이 사각형 취소")
+                cur = []
+                continue
+            next_origin = None  # --rect-origin 기본값은 첫 사각형에만 적용
+            xy = _rect_corner_xy(origin, w_m, l_m)
+            for (u, v), (x, y) in zip(cur, xy):
+                new_pts.append([float(u), float(v), x, y])
+            print("  → 사각형 %d 추가: 근단중앙(%.3f,%.3f), 이번 실행 누적 %d점"
+                  % (len(new_pts) // 4, origin[0], origin[1], len(new_pts)))
+            cur = []
+        if key == ord("u"):
+            if cur:
+                cur.pop()
+            elif new_pts:
+                del new_pts[-4:]
+                print("취소: 마지막 사각형 (이번 실행 누적 %d점)" % len(new_pts))
+        elif key in (ord("q"), 27):
+            break
+    return new_pts
+
+
+# ======================== H 계산/검증 ========================
+
+def _compute_h(pts):
+    arr = np.asarray(pts, np.float64)
+    uv, xy = arr[:, :2], arr[:, 2:]
+    H, _ = cv2.findHomography(uv, xy, 0)  # 점 수 적음 — 전점 최소자승
+    if H is None:
+        sys.exit("H 계산 실패 — 점 배치가 퇴화(일직선?)했거나 좌표 오입력")
+    proj = cv2.perspectiveTransform(uv.reshape(-1, 1, 2), H).reshape(-1, 2)
+    err = np.linalg.norm(proj - xy, axis=1)
+    print("\n===== 재투영 오차 (픽셀 → H → 차량좌표, 단위 m) =====")
+    print(" 점   픽셀(u,v)        실측(x,y)          H투영(x,y)         오차")
+    for i in range(len(err)):
+        print(" %2d  (%6.1f,%6.1f)  (%6.3f,%6.3f)  (%6.3f,%6.3f)  %.3f"
+              % (i + 1, uv[i, 0], uv[i, 1], xy[i, 0], xy[i, 1],
+                 proj[i, 0], proj[i, 1], err[i]))
+    rms = float(np.sqrt(np.mean(err ** 2)))
+    print("RMS %.3f m / 최대 %.3f m" % (rms, float(err.max())))
+    if rms > RMS_WARN_M:
+        print("[경고] RMS %.0fcm > %.0fcm — 실측/클릭 재확인 권장"
+              % (rms * 100, RMS_WARN_M * 100))
+    np.set_printoptions(precision=8, suppress=False)
+    print("H =\n%s" % H)
+    return H, rms
+
+
+def _show_verify(base, pts, H):
+    """실측 좌표를 H 역변환으로 되투영(초록 원) — 클릭점(빨강 십자)과 겹치면 정상."""
+    disp = _draw_points(base, pts)
+    Hinv = np.linalg.inv(H)
+    xy = np.asarray(pts, np.float64)[:, 2:]
+    back = cv2.perspectiveTransform(xy.reshape(-1, 1, 2), Hinv).reshape(-1, 2)
+    for u, v in back:
+        cv2.circle(disp, (int(round(u)), int(round(v))), 7, (0, 255, 0), 2)
+    cv2.rectangle(disp, (0, 0), (disp.shape[1], 26), (0, 0, 0), -1)
+    cv2.putText(disp, "green=measured reprojected | any key = quit", (6, 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.imshow(WIN, disp)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="바닥 H 캘리브 — 픽셀→차량좌표 (자세한 사용법은 파일 헤더)")
+    ap.add_argument("--image", required=True, help="바닥 기준점 사진")
+    ap.add_argument("--camera", required=True, help="camera.yaml (model/K/D 로 undistort)")
+    ap.add_argument("--points", default=None,
+                    help="u,v,x,y CSV. 단독이면 비대화 모드 입력, "
+                         "--rect 와 같이 주면 누적 파일(있으면 읽어서 합침)")
+    ap.add_argument("--rect", action="store_true",
+                    help="A4 등 직사각형 4점 클릭 모드 (대응점 4개 자동 생성)")
+    ap.add_argument("--click", action="store_true",
+                    help="--points 를 줘도 개별 점 클릭 수집을 강제 (기본은 비대화). "
+                         "누적 CSV 위에 원거리 점 등을 더 얹을 때 --append 와 같이 쓴다")
+    ap.add_argument("--rect-size", nargs=2, type=float,
+                    default=[A4_W_M, A4_L_M], metavar=("W", "L"),
+                    help="사각형 실측 크기 m: 좌우 폭 W, 전후 길이 L "
+                         "(기본 %.3f %.3f = A4 세로 배치)" % (A4_W_M, A4_L_M))
+    ap.add_argument("--rect-origin", nargs=2, type=float, default=None,
+                    metavar=("X", "Y"),
+                    help="첫 사각형 근단(가까운) 변 중앙의 차량좌표 m "
+                         "(생략 시 콘솔에서 입력)")
+    ap.add_argument("--append", action="store_true",
+                    help="이번에 만든 대응점을 --points CSV 에 이어 쓴다 (여러 장 누적)")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="plumb_bob undistort 의 getOptimalNewCameraMatrix alpha "
+                         "(0=크롭, 1=화소보존). 생략 시 lib/bev.py 기본값을 따라감 — "
+                         "주행 노드와 반드시 같아야 H 가 유효하다")
+    ap.add_argument("--save", nargs="?", const="@camera", default=None,
+                    help="H 저장. 경로 생략 시 --camera 파일에 병합")
+    args = ap.parse_args()
+
+    if args.append and not args.points:
+        sys.exit("--append 는 --points <csv> 와 같이 써야 한다 (이어 쓸 파일 필요)")
+    if args.rect and args.click:
+        sys.exit("--rect 와 --click 은 같이 쓸 수 없다 — 한 번에 한 수집 방식만. "
+                 "사각형 먼저 돌리고(--rect --append), 그 다음 --click --append 로 "
+                 "같은 CSV 에 개별 점을 얹을 것")
+    if any(v <= 0.0 for v in args.rect_size):
+        sys.exit("--rect-size 는 양수 2개여야 함: %s" % args.rect_size)
+
+    img = cv2.imread(args.image)
+    if img is None:
+        sys.exit("이미지 읽기 실패: %s" % args.image)
+    K, D, model = _load_camera(args.camera)
+    alpha = _default_alpha() if args.alpha is None else float(args.alpha)
+    und, undistorter = _undistort(img, K, D, model, alpha)
+
+    base_pts = []
+    if args.points and os.path.isfile(args.points):
+        base_pts = _load_points_csv(args.points)
+        print("CSV 로드: %d점 (%s)" % (len(base_pts), args.points))
+    elif args.points and not (args.rect or args.click):
+        # 수집 모드(--rect/--click)면 CSV 를 새로 만들 수 있다. 비대화 모드는 불가.
+        sys.exit("--points 파일 없음: %s" % args.points)
+
+    if args.rect:
+        origin = tuple(args.rect_origin) if args.rect_origin else None
+        new_pts = _collect_rects(und, tuple(args.rect_size), origin, base_pts)
+    elif args.points and not args.click:
+        new_pts = []      # 비대화 모드 — CSV 만 사용
+    else:
+        new_pts = _collect_interactive(und, base_pts)
+
+    pts = base_pts + new_pts
+    if new_pts and args.append:
+        note = "%s (%s, rect %.3fx%.3f)" % (
+            os.path.basename(args.image), "rect" if args.rect else "click",
+            args.rect_size[0], args.rect_size[1])
+        _append_points_csv(args.points, new_pts, note)
+
+    if len(pts) < MIN_POINTS:
+        sys.exit("점 %d개 — 최소 %d개 필요" % (len(pts), MIN_POINTS))
+    print("H 계산에 쓰는 대응점: %d개 (기존 %d + 신규 %d)"
+          % (len(pts), len(base_pts), len(new_pts)))
+
+    H, rms = _compute_h(pts)
+
+    if new_pts:
+        _show_verify(und, pts, H)
+
+    if args.save is not None:
+        save_path = args.camera if args.save == "@camera" else args.save
+        data = _load_yaml(save_path)
+        data["H"] = [[float(v) for v in row] for row in H]
+        data["h_calibrated"] = True
+        data["h_rms_m"] = float(round(rms, 4))
+        data["h_model"] = model  # 이 H 가 어느 왜곡 모델의 undistort 기준인지 기록
+        data["h_points"] = [[float(v) for v in p] for p in pts]  # 기록용 (u,v,x,y)
+        if undistorter is not None:
+            # ★ H 는 undistort 픽셀 기준 — 그때 쓴 new_K 를 같이 남겨야 런타임이
+            #   bev.check_new_K_match() 로 좌표계 일치를 검증할 수 있다.
+            nk = np.asarray(undistorter.new_K, np.float64).reshape(3, 3)
+            data["new_K"] = [[float(v) for v in row] for row in nk]
+            data["h_alpha"] = float(alpha)
+            print("new_K 기록: fx,fy,cx,cy = %.3f %.3f %.3f %.3f (alpha=%.2f)"
+                  % (nk[0, 0], nk[1, 1], nk[0, 2], nk[1, 2], alpha))
+        else:
+            # undistort 를 안 탔으면 H 는 원본 픽셀 기준 — 낡은 new_K 를 남기면
+            # 런타임이 잘못된 좌표계를 '일치'로 오판한다.
+            if data.pop("new_K", None) is not None:
+                print("[안내] undistort 미적용이라 기존 new_K 항목을 제거했다.")
+            data.pop("h_alpha", None)
+        intr = _flag(data, "intrinsics_calibrated")
+        data["calibrated"] = bool(intr)  # K/D 까지 있어야 true
+        _save_camera_yaml(save_path, data, "tools/calib_ground_h.py")
+        if not intr:
+            print("[경고] K/D 미캘리브 상태 — calibrated 는 false 유지. "
+                  "calib_camera.py(또는 import_camera_info.py) 후 이 도구를 다시 "
+                  "돌릴 것 (undistort 기준이 달라짐).")
+        else:
+            print("다음 단계: verify_lidar_cam.py 로 라이다-카메라 정합 육안 확인")
+
+
+if __name__ == "__main__":
+    main()

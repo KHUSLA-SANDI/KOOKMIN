@@ -1,0 +1,58 @@
+# =====================================================================
+# car.yaml — 차량 고유 실측값 (본선 실차 Xycar 캘리브레이션 결과)
+# 이 파일에 시뮬 유래 값은 없다. 값을 바꾸려면 실측 근거가 먼저다.
+# 로드: drive.launch.py 가 tuning.yaml 뒤에 전달 → 같은 키는 이 파일이 우선.
+# 참고: /drive_cmd·/teleop_cmd 워치독 0.3s 는 토픽 계약 상수라 파라미터가 아님
+#       (lib/drive_cmd.py DRIVE_CMD_STALE_SEC=0.3 / TELEOP_STALE_SEC=0.3).
+# =====================================================================
+
+motion_node:
+  ros__parameters:
+    # ---- CarInterface 키 (lib/car_interface.py DEFAULT_CFG 와 동일) ----
+    steer_trim: -20.0          # 직진 트림: 명령 -20 이 직진 (실측)
+    steer_scale: 0.42          # 논리 조향(±100) → 기계 조향 스케일
+    steer_limit_left: -32.0    # 트림 기준 좌 기계 스톱 (실측 -34, 마진 포함)
+    steer_limit_right: 62.0    # 트림 기준 우 기계 스톱 (실측 +64, 마진 포함)
+    slew_angle_per_tick: 8.0   # 20Hz 틱당 조향 출력 변화 상한
+    slew_speed_per_tick: 1.5   # 틱당 속도 변화 상한 — 센서리스 ESC 정지→고속 직행 불가(램프 필수)
+    speed_deadzone: 4.0        # 명령 4 미만은 안 구름 (실측)
+    allow_reverse: false       # 자율주행 경로는 후진 금지
+    cmd_to_ms: 0.08            # speed 명령 ×0.08 = m/s (실측검증; eRPM = 4614×m/s)
+    # ---- 중재 하한 ----
+    speed_min_drive: 5.0       # 주행 최저 명령 — 데드존(4) 초과 보장 (재도입 금지 버그 7 대응)
+
+teleop_node:
+  ros__parameters:
+    # ---- CarInterface 키 (텔레옵 직발행 경로도 같은 실차 변환 사용) ----
+    steer_trim: -20.0          # 직진 트림 (실측)
+    steer_scale: 0.42
+    steer_limit_left: -32.0    # (실측 -34, 마진 포함)
+    steer_limit_right: 62.0    # (실측 +64, 마진 포함)
+    slew_angle_per_tick: 8.0
+    slew_speed_per_tick: 1.5   # 센서리스 기동 램프
+    speed_deadzone: 4.0        # (실측)
+    allow_reverse: true        # 텔레옵만 후진 허용
+    cmd_to_ms: 0.08            # (실측검증)
+    # ---- teleop 조작감 ----
+    rate_hz: 20.0              # 모터는 20Hz 연속 수신 필요
+    speed_step: 2.0            # w/s 한 번당 목표속도 변화
+    steer_steps: 5             # a/d 조향 칸 수 (홀수 — 3번이 직진)
+    # 좌우 기계 스톱이 비대칭이라(좌 -32 / 우 +62) 옛 방식은 각 방향을 그 방향
+    # 최대까지 등분했고, 그래서 좌 2칸(-32)이 우 1칸(+31)과 맞먹어 조작이 안 맞았다.
+    # true = 좁은 쪽(좌)에 맞춰 양쪽 칸 크기를 같게. 우회전 최대는 D 키로 그대로 쓴다.
+    steer_symmetric: true
+    angle_step: 5.0            # (구버전 호환 — 이산 단계 방식에선 안 쓴다)
+    angle_step_big: 24.0       # (구버전 호환)
+    speed_max: 100.0
+    speed_min: -50.0           # 후진 한계 (allow_reverse 전제)
+    # 0 = 끔. 키를 안 눌러도 계속 달린다 (직진 주행 중 자동 정지가 방해돼서 껐다).
+    # ★ 꺼도 teleop 프로세스가 죽으면 차는 선다 — /teleop_cmd 가 0.3초 끊기면
+    #   motion 이 자율로 되돌아가고, 자율 입력이 없으면 정지한다.
+    watchdog_sec: 0.0
+
+car_state_node:
+  ros__parameters:
+    # ---- VESC/배터리 실측 상수 ----
+    erpm_per_ms: 4614.0        # eRPM = 4614 × m/s (실측검증)
+    tacho_scale: 0.0           # tacho→m 환산계수. 0 = 미실측 → eRPM 적분 폴백 사용
+    low_voltage_warn: 8.6      # NiMH 완충 10~11V, 8.6V 미만 경고 (실측)

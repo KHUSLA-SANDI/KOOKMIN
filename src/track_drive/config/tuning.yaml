@@ -1,0 +1,212 @@
+# =====================================================================
+# tuning.yaml — 노드별 튜닝 파라미터 (각 노드 declare_parameter 추출본)
+# "# [SIM]" = 시뮬(예선) 유래 값 — 본선 실차에서 재튜닝 대상.
+# 차량 고유 실측값(트림/기계스톱/데드존/cmd_to_ms 등)은 config/car.yaml 로 분리
+# (drive.launch.py 가 car.yaml 을 뒤에 전달 → 같은 키는 car.yaml 이 우선).
+# 형식: ROS2 파라미터 yaml — 노드명: ros__parameters: (int/float/bool 타입 엄수).
+# =====================================================================
+
+yolo_node:
+  ros__parameters:
+    imgsz: 416                     # [SIM=640] CPU 3모델 순차 ≈11.5Hz 실측
+    conf_lane: 0.25                # [SIM]
+    conf_obj: 0.25                 # [SIM]
+    conf_light: 0.4                # [SIM]
+    light_debounce_n: 3            # 신호등 연속 동일판정 프레임 수
+    enable_lane: true
+    enable_obj: true
+    enable_light: true
+    enable_child_dash: false       # dash(z=16) 발행 루프만 준비
+    device: "cpu"                  # 실차 CPU 전용 (CUDA 없음)
+    # lane_model_path / obj_model_path / light_model_path / camera_yaml:
+    #   기본값 = 소스 트리 config/ 상대경로 (yolo_node.py 상단 DEFAULT_*).
+    #   절대경로로 바꿔야 할 때만 여기서 오버라이드.
+
+path_planner_node:
+  ros__parameters:
+    # ---- 출발/공통 ----
+    start_confirm_ticks: 6         # [SIM] 기존 6틱 출발 확인 유지
+    start_grace_sec: 20.0          # [SIM] 기존 400틱 — 출발 후 정지선/지름길 무시
+    objects_fresh_sec: 0.5         # /detect/objects 신선도 (v임계 판정 전제)
+    manual_go_fresh_sec: 2.0       # /manual_go 유효 시간 (실소비 전 잔류 방지)
+    lane_quality_min: 0.3          # 이 미만이면 감속 cap
+    low_quality_speed_cap: 7.0     # [SIM] 차선 품질 저하 시 speed_cap
+    # ---- 클러스터/트래커 (lib/cluster.py) ----
+    cluster_gap_m: 0.35            # [SIM] 예선 CLUSTER_GAP 계승
+    cluster_padding: 0.05          # [SIM] 예선 CLUSTER_PADDING 계승
+    cluster_gap_per_m: 0.05
+    cluster_min_pts: 2
+    cluster_r_min: 0.05
+    cluster_r_max: 8.0
+    tracker_k: 2                   # k-of-n 확정 관측
+    tracker_n: 3
+    tracker_match_dist: 0.5
+    # ---- 회피 (lib/path_gen.py) ----
+    avoid_clear_margin: 0.45       # 차폭/2 + 여유 (m)
+    avoid_ramp_step: 0.06          # 호출당 오프셋 변화 상한 (m)
+    avoid_left_offset_max: 0.9     # 좌(+y) 상한 — 좌 조향 스톱 여유 부족
+    avoid_obs_r_max: 0.6           # 이보다 큰 클러스터(벽 등)는 회피 대상 제외
+    avoid_obs_x_max: 8.0           # 회피 대상 전방 거리 상한 (m)
+    # ---- CONE 진입/종료 (실차 신규: 감지 기반) ----
+    cone_enter_r_min: 0.1          # 콘으로 볼 클러스터 반경 하한 (m)
+    cone_enter_r_max: 0.4          # 콘으로 볼 클러스터 반경 상한 (m)
+    cone_enter_min_clusters: 4     # ROI 안 콘 클러스터 최소 개수
+    cone_enter_scans: 3            # 연속 스캔 수 (진입 디바운스)
+    cone_exit_miss_scans: 20       # miss 연속 스캔 수 (기존 40틱 → 20스캔)
+    cone_grace_sec: 1.0            # [SIM] 기존 20틱 — 진입 직후 miss 미계수
+    cone_reenter_block_sec: 5.0    # CONE 종료 직후 재진입 차단 (핑퐁 방지)
+    cone_speed_cap: 16.0           # [SIM] 예선 CONE_SPEED_FIXED — fixed 아님, cap
+    corridor_fresh_sec: 0.5        # /corridor_path 신선도 (기준선 우선 사용)
+    # ---- CONE 왼쪽 콘 피팅 (기존 _tick_cone 이식) ----
+    cone_x_min: 0.3                # [SIM] 전방 ROI 최소 (m)
+    cone_x_max: 10.0               # [SIM] 전방 ROI 최대 (m)
+    cone_y_min: -6.0               # [SIM] 좌우 ROI (m)
+    cone_y_max: 6.0                # [SIM]
+    track_width: 4.4               # [SIM] 예선 트랙 폭 — 본선 실측 예정
+    cone_fit_min_points: 2         # [SIM]
+    cone_fit_min_x_span: 0.8       # [SIM]
+    cone_fit_deg2_span: 2.0        # [SIM] x스팬 이 이상 + 3점이면 2차 피팅
+    cone_fit_curve_max: 1.5        # [SIM]
+    cone_fit_slope_max: 3.0        # [SIM]
+    cone_left_accept_dist: 1.5     # [SIM]
+    cone_fit_smooth_alpha: 0.20    # [SIM]
+    cone_coast_decay: 0.2          # [SIM] miss당 곡률항 감쇠
+    cone_single_bias: 0.268        # [SIM] 콘 1개 이하 시 시계방향 15°(tan15°) 보정
+    cone_sample_x_start: 0.5       # [SIM]
+    cone_sample_x_end: 6.0         # [SIM]
+    cone_sample_n: 25              # [SIM]
+    # ---- 정지선(STOP) / SHORTCUT — heading은 전부 yaw_rel 기준 ----
+    # ★ 아래 *_v_thr* 는 전부 obj_v_ref_height(480p) 기준 픽셀값이다.
+    #   실차 카메라가 1080p 여도 planner 가 480p 로 환산해서 비교하므로
+    #   해상도를 바꿔도 이 값들은 그대로 두면 된다 (path_planner_node._resolve_obj_v_scale).
+    obj_v_ref_height: 480.0        # v 임계값들이 튜닝된 기준 높이 — 바꾸지 말 것
+    stop_v_threshold: 312.0        # [SIM] 480p 기준 STOP bbox 하단 v
+    cross_v_threshold: 278.0       # [SIM] CROSSROAD_OUT bbox 하단 v
+    stop_heading_rel: 0.0          # 정지선 직선 구간 yaw_rel (deg) — 코스 실측 예정
+    stop_heading_tol: 10.0         # [SIM] ±허용 (deg)
+    stop_block_heading_rel: -90.0  # [SIM] 기존 절대 270° 등가 — 코스 실측 예정
+    stop_block_tol: 5.0            # [SIM] ±허용 (deg)
+    stop_block_sec: 3.0            # [SIM] 기존 60틱 — 통과 후 정지선 트리거 차단
+    sc_turn_target_deg: 90.0       # 좌회전 목표 |Δyaw| (deg) — 코스 실측 예정
+    sc_turn_timeout_sec: 6.0       # BLOCK 안전망 (yaw 미갱신 대비 강제 진행)
+    sc_follow_timeout_sec: 15.0    # [SIM] 기존 300틱 — 하드 타임아웃 복원
+    left_debounce_hits: 2          # [SIM] LEFT 이벤트 최소 검출 횟수
+    shortcut_speed_cap: 15.0       # [SIM] 예선 SHORTCUT_SPEED — cap으로
+    # ---- PEDESTRIAN (본선은 회피로 대체 예정 — 기본 비활성) ----
+    enable_pedestrian: false
+    ped_x_min: 1.5                 # [SIM]
+    ped_x_max: 8.0                 # [SIM]
+    ped_r_min: 0.1                 # [SIM] 사람 크기 클러스터 반경
+    ped_r_max: 0.4                 # [SIM]
+    ped_road_half_width: 1.2       # [SIM] center 기준 도로 반폭
+    ped_stop_sec: 2.2              # [SIM] 기존 44틱 정지
+    ped_cooldown_sec: 30.0         # [SIM] 기존 600틱
+    ped_freeze_sec: 1.5            # [SIM] 기존 30틱 center freeze
+    ped_car_cluster_count: 3       # [SIM] 밀집=차 판정 개수
+    ped_car_spread: 1.5            # [SIM] 밀집 판정 거리
+    # ---- CHILD ZONE (기본 비활성) ----
+    enable_child_zone: false
+    child_start_v_thr: 200.0       # [SIM]
+    child_end_v_thr: 400.0         # [SIM]
+    child_exit_delay_sec: 3.0      # [SIM] 기존 60틱
+    child_enter_cooldown_sec: 3.0  # [SIM] 기존 60틱
+    child_exit_cooldown_sec: 10.0  # [SIM] 기존 200틱
+    child_hard_timeout_sec: 17.0   # [SIM] 기존 340틱
+    child_speed_cap: 22.0          # [SIM] 예선 CHILD_ZONE_SPEED
+    corner_boost_window_sec: 20.0  # [SIM] 기존 400틱 — child 종료 후 부스트 창
+    corner_boost_floor: 0.0        # speed_floor. 0=비활성 — 본선 튜닝 예정
+    # ---- S존 (기본 비활성 — 켜면 yaw_rel 기준) ----
+    enable_s_zone: false
+    s_zone_yaw_lo: 10.0            # [SIM] yaw_rel 하한 (deg)
+    s_zone_yaw_hi: 170.0           # [SIM] yaw_rel 상한 (deg)
+    s_zone_block_sec: 8.0          # [SIM] 기존 160틱 — CONE→LANE 직후 오인 차단
+    # ---- 라이다 측면/정면 창 (기존 _check_side 이식) ----
+    side_left_angle_deg: 90.0      # [SIM] 왼쪽 9시 방향
+    side_right_angle_deg: -88.0    # [SIM]
+    side_half_deg: 3.0             # 기존 ±1° → ±3° (500빔 incr 0.72° 대응)
+    side_left_r_min: 0.5           # [SIM]
+    side_left_r_max: 3.2           # [SIM]
+    side_right_r_min: 0.01         # [SIM]
+    side_right_r_max: 3.0          # [SIM]
+    side_debounce_scans: 3         # 연속 스캔 수 기준 (기존 틱 기준 대체)
+    front_half_deg: 6.0            # [SIM] 정면 콘 반각
+    front_r_min: 0.3               # [SIM]
+    front_r_max: 8.0               # [SIM]
+
+motion_node:
+  ros__parameters:
+    control_hz: 20.0               # 계약: /xycar_motor 20Hz 연속 발행
+    # ---- 다점 추종 게인 (가우시안 focus 가중 PP) ----
+    straight_pursuit_gain: 0.08    # [SIM]
+    straight_heading_gain: 0.08    # [SIM]
+    straight_boost_pursuit_gain: 0.40  # [SIM]
+    straight_boost_heading_gain: 0.40  # [SIM]
+    curve_pursuit_gain: 1.62       # [SIM]
+    curve_heading_gain: 2.22       # [SIM]
+    s_steer_focus_x: 3.7           # [SIM] S_ZONE 전용 lookahead
+    steer_focus_sigma: 1.8         # [SIM] 가중 폭 (m)
+    steer_focus_base: 3.8          # [SIM] 속도비례 lookahead: clip(BASE + K*직전속도, MIN, MAX)
+    steer_focus_k: 0.055           # [SIM]
+    steer_focus_min: 4.2           # [SIM]
+    steer_focus_max: 5.0           # [SIM]
+    steer_gain_distance_m: 2.4     # [SIM]
+    steer_preview_distance_m: 5.5  # [SIM]
+    steer_heading_start_deg: 4.0   # [SIM]
+    steer_heading_full_deg: 20.0   # [SIM]
+    steer_curve_switch_ratio: 0.50  # [SIM]
+    # ---- 직진 부스트 ----
+    straight_boost_on_deg: 5.0     # [SIM]
+    straight_boost_full_deg: 10.0  # [SIM]
+    straight_boost_off_deg: 0.0    # [SIM]
+    straight_boost_max_level: 1.8  # [SIM]
+    straight_boost_blend_alpha: 0.45  # [SIM]
+    # ---- corner-exit unwind ----
+    corner_exit_unwind_start_ratio: 0.45  # [SIM]
+    corner_exit_unwind_end_ratio: 0.22    # [SIM]
+    corner_exit_unwind_frames: 5   # [SIM]
+    corner_exit_unwind_scale: 0.80  # [SIM]
+    unwind_block_ticks: 5          # 전환 직후 unwind 트리거 금지 게이트 (신규)
+    # ---- 조향 스무딩 (IIR + 스텝 + 데드밴드) ----
+    angle_smooth_alpha: 0.55       # [SIM]
+    angle_max_step: 12.0           # [SIM]
+    angle_deadband: 0.6            # [SIM]
+    # ---- steer_profile 반영 ----
+    cone_steer_gain: 1.12          # [SIM] CONE 조향 보정
+    # ---- 속도 (각도 cap + preview cap + 코너 inside floor) ----
+    speed_default: 24.0            # [SIM]
+    speed_curve_base: 20.0         # [SIM] 직진미확정 cap 겸용
+    speed_min: 3.0                 # [SIM] _speed_from_angle 내부 최저 (최종 하한은 car.yaml speed_min_drive)
+    speed_slow_start_deg: 12.0     # [SIM]
+    speed_slow_full_deg: 40.0      # [SIM]
+    preview_slow_speed: 4.5        # [SIM]
+    straight_confirm_ticks: 20     # [SIM] 직진 확정까지 틱 수
+    corner_inside_speed: 7.2       # [SIM] = 8.0km/h × 4.5/5.0 (예선 환산계수)
+    corner_boost_speed: 9.0        # [SIM] = 10.0km/h × 4.5/5.0
+    corner_enter_ratio: 0.55       # [SIM]
+    corner_hold_frames: 4          # [SIM]
+    corner_exit_ratio: 0.35        # [SIM]
+    corner_exit_angle_scale: 0.60  # [SIM]
+    corner_inside_angle_scale: 0.82  # [SIM]
+    preview_curv_start: 0.018      # [SIM]
+    preview_curv_full: 0.080       # [SIM]
+    preview_lateral_start_m: 0.45  # [SIM]
+    preview_lateral_full_m: 1.35   # [SIM]
+    preview_distance_m: 5.0        # [SIM]
+    # ---- 경로 세그먼트 ----
+    target_y_limit: 4.0            # [SIM]
+    lookahead_x_min: 1.0           # [SIM]
+    lookahead_x_max: 10.0          # [SIM]
+    reanchor_far_m: 0.65           # [SIM]
+    # ---- lane-lost (직전각 유지 + 선형 감속) ----
+    path_stale_sec: 0.5            # [SIM] 예선 PATH_MEMORY_TIMEOUT_S
+    lane_lost_decel_sec: 1.0       # 1초에 걸쳐 0으로
+    # ---- BLOCK 실행값 (종료 판정은 planner 몫) ----
+    block_steer_angle: -100.0      # [SIM] 좌회전 하드코딩 조향
+    block_speed: 10.0              # [SIM] 좌회전 속도
+    # steer_trim 등 CarInterface 키 + speed_min_drive 는 car.yaml (실측값)
+
+car_state_node:
+  ros__parameters:
+    rate_hz: 20.0                  # /car_state 발행 주기 (계약)
+    auto_capture: true             # 첫 IMU 수신 시 yaw 기준각 자동 캡처
+    # erpm_per_ms / tacho_scale / low_voltage_warn 은 car.yaml (실측값)

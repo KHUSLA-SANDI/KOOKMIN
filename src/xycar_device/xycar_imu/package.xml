@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+    <name>xycar_imu</name>
+    <version>1.2.0</version>
+    <description>
+        xycar_imu is a package that provides a ROS2 driver
+        for the Sparkfun Razor IMU 9DOF. It also provides Arduino
+        firmware that runs on the Razor board, and which must be
+        installed on the Razor board for the system to work. A node
+        which displays the attitude (roll, pitch and yaw) of the Razor board
+        (or any IMU) is provided for testing.
+    </description>
+
+    <maintainer email="krirobo@gmail.com">Kristof Robot</maintainer>
+
+    <license>BSD</license>
+
+    <author>Tang Tiong Yew</author>
+    <author>Kristof Robot</author>
+    <author>Paul Bouchier</author>
+    <author>Peter Bartz</author>
+
+    <url type="website">http://ros.org/wiki/xycar_imu</url>
+
+    <depend>rclpy</depend>
+    <depend>tf2</depend>
+    <depend>sensor_msgs</depend>
+    <depend>python-serial</depend>
+    <depend>vpython</depend>
+    <depend>wxPython</depend>
+    <depend>transforms3d</depend>
+
+    <export>
+        <build_type>ament_python</build_type>
+    </export>
+</package>
+
+

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DDS 를 우리 차 안 + 직결 랜선까지만 쓰게 묶는다.
+
+  왜 필요한가 (2026-08-12 실측)
+    학교 와이파이(10.102.x.x/19, 8190대가 한 대역)에 붙어 있으면 같은
+    ROS_DOMAIN_ID 를 쓰는 남의 자이카가 자동으로 우리와 연결된다. DDS 는
+    기본적으로 인증이 없고 ROS_DOMAIN_ID 는 비밀번호가 아니라 포트 번호일
+    뿐이다. 실제로 남의 조종기가 쏘는 /joy 가 우리 ros1_bridge 로 들어와
+    우리 차를 움직였다. 반대로 우리 명령도 남의 차를 움직였을 것이다.
+
+  여기 적은 주소로만 통신한다 (없는 주소는 그냥 무시되니 안전하다)
+    127.0.0.1     차 안 (노드끼리 — 우리 노드는 전부 차에서 돈다)
+    192.168.50.1  노트북 직결 랜선  ← 이건 살려야 rqt/rviz 를 노트북에서 본다
+    10.42.0.1     차 자체 핫스팟
+    172.17.0.1    도커 (ROS1 컨테이너)
+  ★ 와이파이 동글(10.102.x.x)은 일부러 뺐다. 그게 유일한 유출 경로다.
+-->
+<dds>
+  <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>lan_only_udp</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+          <address>192.168.50.1</address>
+          <address>10.42.0.1</address>
+          <address>172.17.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="lan_only" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>lan_only_udp</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

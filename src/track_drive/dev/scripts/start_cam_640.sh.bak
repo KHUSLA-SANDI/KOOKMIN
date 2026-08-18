@@ -1,0 +1,26 @@
+#!/bin/bash
+# 차에서 카메라를 백그라운드로 기동하고 실제 발행까지 확인
+source /opt/ros/humble/setup.bash
+source /home/xytron/xycar_ws/install/setup.bash
+export ROS_DOMAIN_ID=7
+
+PAT='usb_cam_node_exe'
+if pgrep -f "$PAT" | grep -qv '^1$'; then
+  echo "이미 실행중:"; pgrep -af "$PAT" | head -2
+else
+  echo "카메라 기동..."
+  setsid nohup ros2 run usb_cam usb_cam_node_exe --ros-args -r __node:=xycar_cam \
+      -p video_device:=/dev/video0 -p pixel_format:=yuyv2rgb \
+      -p image_width:=640 -p image_height:=480 -p framerate:=30.0 \
+      > /tmp/cam.log 2>&1 < /dev/null &
+  sleep 14
+fi
+
+echo "=== 프로세스 ==="
+pgrep -af "$PAT" | head -2 || echo "  ❌ 기동 실패"
+echo "=== 발행 확인 (실제 데이터가 오는가) ==="
+timeout 8 ros2 topic hz /image_raw 2>&1 | grep -oE "average rate: [0-9.]+" | head -1 || echo "  ❌ 발행 안 됨"
+echo "=== 발행자 수 ==="
+timeout 5 ros2 topic info /image_raw 2>&1 | head -3
+echo "=== 로그 마지막 ==="
+tail -2 /tmp/cam.log
