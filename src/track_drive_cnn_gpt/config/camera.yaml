@@ -25,4 +25,3 @@ camera:
   # undistorted new_K 영상에서 이 행 아래는 차체이므로 BEV로 보내지 않는다.
   car_mask_v: 951.4285714285714
   calibration_source: "tools/ground_fit.py physical model, 2026-08-18"
-

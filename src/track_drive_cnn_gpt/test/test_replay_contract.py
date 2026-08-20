@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import yaml
 
@@ -13,6 +15,8 @@ from track_drive_cnn_gpt.replay_io import (
     percentile,
 )
 from track_drive_cnn_gpt.replay_source_node import _spin_until_exit
+from track_drive_cnn_gpt.replay_preview_node import ReplayPreviewNode
+from track_drive_cnn_gpt.replay_recorder_node import ReplayRecorderNode
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -119,7 +123,14 @@ def test_replay_launch_cannot_start_drive_nodes():
     launch = (ROOT / "launch" / "replay_perception_cnn.launch.py").read_text(
         encoding="utf-8"
     )
-    for forbidden in ("cnn_supervisor", "cnn_motion", "xycar_motor", "drive_cmd"):
+    for forbidden in (
+        "cnn_supervisor",
+        "cnn_drive_gate",
+        "mission_route",
+        "cnn_motion",
+        "xycar_motor",
+        "drive_cmd",
+    ):
         assert forbidden not in launch
     assert 'executable="replay_images"' in launch
     assert 'executable="yolo_bev"' in launch
@@ -178,3 +189,64 @@ def test_replay_completion_never_shuts_down_rclpy_inside_callback():
     }
     assert "shutdown" not in called_attributes
     assert "_exit_deadline_mono" in ast.unparse(finish)
+
+
+def test_replay_summary_reports_selected_path_and_route_intent():
+    fake = SimpleNamespace(
+        _output_path=Path("/tmp/result.jsonl"),
+        _started_wall=1.0,
+        _started_mono=0.0,
+        _counts={"path_main": 2, "path_selected": 2},
+        _main_stamps=[1_000_000_000, 2_000_000_000],
+        _shortcut_stamps=[],
+        _selected_stamps=[1_000_000_000, 2_000_000_000],
+        _main_valid_stamps=[1_000_000_000, 2_000_000_000],
+        _shortcut_valid_stamps=[],
+        _selected_valid_stamps=[1_000_000_000, 2_000_000_000],
+        _route_intent="shortcut",
+        _route_intent_messages=2,
+        _route_intent_transitions=1,
+        _route_intent_counts={"main": 1, "shortcut": 1},
+        _yolo_inference_ms=[],
+        _yolo_total_ms=[],
+        _cnn_total_ms=[],
+        _cnn_ok=2,
+        _cnn_reasons={},
+        _rate=ReplayRecorderNode._rate,
+        _latency=ReplayRecorderNode._latency,
+    )
+    summary = ReplayRecorderNode._summary(fake)
+    assert summary["schema"] == "track_drive_replay_summary_v2_gpt"
+    assert summary["valid_path_counts"]["selected"] == 2
+    assert summary["selected_path_hz"] == pytest.approx(1.0)
+    assert summary["selected_valid_path_hz"] == pytest.approx(1.0)
+    assert summary["route_intent"] == {
+        "last": "shortcut",
+        "messages": 2,
+        "transitions": 1,
+        "counts": {"main": 1, "shortcut": 1},
+    }
+
+
+def test_preview_draws_selected_path_over_candidate_paths():
+    fake = SimpleNamespace(_bev_scale=1)
+    bev = np.zeros((128, 120, 3), dtype=np.uint8)
+    empty = np.empty((0, 2), dtype=np.float32)
+    selected = np.asarray([[1.0, 0.0]], dtype=np.float32)
+    panel = ReplayPreviewNode._bev_panel(fake, bev, empty, empty, selected)
+    row = int(np.floor((3.0 - 1.0) / 0.025))
+    col = int(np.floor((1.5 - 0.0) / 0.025))
+    assert tuple(panel[row, col]) == (255, 255, 0)
+
+
+def test_replay_outputs_subscribe_to_direct_selected_path_and_route():
+    recorder = (
+        ROOT / "track_drive_cnn_gpt" / "replay_recorder_node.py"
+    ).read_text(encoding="utf-8")
+    preview = (
+        ROOT / "track_drive_cnn_gpt" / "replay_preview_node.py"
+    ).read_text(encoding="utf-8")
+    for source in (recorder, preview):
+        assert '"/center_path"' in source
+        assert '"/route_intent"' in source
+    assert '"path_selected"' in recorder

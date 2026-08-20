@@ -3,9 +3,11 @@
 
 The input BEV message contains yellow/white channels only.  This node selects
 the nearest received LaserScan, obtains a camera-only reference path, compacts
-one unambiguous obstacle cluster into the training LiDAR domain, and publishes
-sanitized main and shortcut paths.  It never republishes an old prediction
-with a new stamp.
+one unambiguous obstacle cluster into the training LiDAR domain, and predicts
+sanitized main and shortcut paths.  The same-pass YOLO signal topic is consumed
+here: confirmed LEFT latches shortcut, then the selected path is published
+directly on ``/center_path`` for motion.  It never republishes an old
+prediction with a new stamp.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import Image, LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from .lidar_compact import compact_obstacle_points
 from .lidar_geometry import (
@@ -46,6 +48,13 @@ from .path_contract import (
     count_camera_evidence,
 )
 from .path_model import load_path_model
+from .signal_mission import (
+    ROUTE_MAIN,
+    ROUTE_SHORTCUT,
+    SequencedRouteIntentLatch,
+    decode_signal_payload,
+    select_route_value,
+)
 
 
 LATEST_QOS = QoSProfile(
@@ -88,6 +97,16 @@ class CnnPathNode(Node):
         self._scan_topic = str(p("scan_topic", "/scan"))
         main_topic = str(p("main_path_topic", "/cnn/path_main"))
         shortcut_topic = str(p("shortcut_path_topic", "/cnn/path_shortcut"))
+        center_topic = str(p("center_path_topic", "/center_path"))
+        signal_topic = str(p("signal_topic", "/perception/signals"))
+        route_intent_topic = str(p("route_intent_topic", "/route_intent"))
+        route_reset_topic = str(p("route_reset_topic", "/route_intent_reset"))
+        self._enable_center_path = bool(p("enable_center_path", True))
+        self._route_logic = SequencedRouteIntentLatch(
+            left_confirm_frames=int(p("left_confirm_frames", 2)),
+            left_confidence=float(p("left_confidence", 0.25)),
+        )
+        self._last_center_message: Optional[PoseArray] = None
         model_path = str(p("model_path", ""))
         expected_model_sha256 = str(p("expected_model_sha256", ""))
         device = str(p("device", "cpu"))
@@ -204,6 +223,8 @@ class CnnPathNode(Node):
         self._last_scan_error_log_ns = -1
         self._main_pub = self.create_publisher(PoseArray, main_topic, 1)
         self._shortcut_pub = self.create_publisher(PoseArray, shortcut_topic, 1)
+        self._center_pub = self.create_publisher(PoseArray, center_topic, 1)
+        self._route_pub = self.create_publisher(String, route_intent_topic, 1)
         self._diag_pub = self.create_publisher(String, "/debug/cnn_path", 10)
         self.create_subscription(
             LaserScan,
@@ -212,15 +233,74 @@ class CnnPathNode(Node):
             qos_profile_sensor_data,
         )
         self.create_subscription(Image, self._bev_topic, self._on_bev, LATEST_QOS)
+        self.create_subscription(String, signal_topic, self._on_signals, 1)
+        self.create_subscription(Bool, route_reset_topic, self._on_route_reset, 1)
         self.get_logger().info(
             f"CNN path ready kind={self._path_model.model_kind} "
             f"input={INPUT_SHAPE} device={device} "
-            f"lidar_mode={self._lidar_preprocess_mode}"
+            f"lidar_mode={self._lidar_preprocess_mode} "
+            f"direct_center_path={str(self._enable_center_path).lower()}"
         )
 
     def _parameter(self, name, default):
         self.declare_parameter(name, default)
         return self.get_parameter(name).value
+
+    def _publish_route_intent(self) -> None:
+        message = String()
+        message.data = self._route_logic.route_intent
+        self._route_pub.publish(message)
+
+    def _on_signals(self, message: String) -> None:
+        """Update the route latch from the same YOLO pass used for BEV."""
+
+        try:
+            sequence, signals = decode_signal_payload(message.data)
+        except ValueError as exc:
+            self.get_logger().warning(
+                f"rejected signal payload: {exc}",
+                throttle_duration_sec=1.0,
+            )
+            return
+        update = self._route_logic.observe(sequence, signals)
+        if not update.accepted:
+            return
+        if update.source_restarted:
+            self.get_logger().warning(
+                "YOLO signal sequence restarted; LEFT confirmation streak reset"
+            )
+        if update.route_changed:
+            self.get_logger().info("direct path route latched: shortcut")
+            self._publish_route_intent()
+
+    def _on_route_reset(self, message: Bool) -> None:
+        if not message.data:
+            return
+        self._route_logic.reset_main()
+        # The previous shortcut must not remain cached in motion until the
+        # next camera frame.  Invalidate it using the original source stamp;
+        # never make an old path look new by assigning the reset time.
+        if self._last_center_message is not None:
+            invalid = PoseArray()
+            invalid.header.stamp.sec = self._last_center_message.header.stamp.sec
+            invalid.header.stamp.nanosec = (
+                self._last_center_message.header.stamp.nanosec
+            )
+            invalid.header.frame_id = self._last_center_message.header.frame_id
+            self._center_pub.publish(invalid)
+            self._last_center_message = invalid
+        self.get_logger().info("direct path route explicitly reset: main")
+        self._publish_route_intent()
+
+    def _publish_center(self, path: SanitizedPath, header) -> SanitizedPath:
+        published = path
+        if not self._enable_center_path:
+            published = self._invalid_path("center_path_output_disabled")
+        message = path_message(published, header)
+        self._center_pub.publish(message)
+        self._last_center_message = message
+        self._publish_route_intent()
+        return published
 
     def _on_scan(self, message: LaserScan) -> None:
         received_ns = self.get_clock().now().nanoseconds
@@ -292,7 +372,16 @@ class CnnPathNode(Node):
         empty = self._invalid_path(reason)
         self._main_pub.publish(path_message(empty, header))
         self._shortcut_pub.publish(path_message(empty, header))
-        payload = {"ok": False, "reason": reason, **extra}
+        selected = self._publish_center(empty, header)
+        payload = {
+            "ok": False,
+            "reason": reason,
+            "route_intent": self._route_logic.route_intent,
+            "selected_route": self._route_logic.route_intent,
+            "selected_usable": selected.usable,
+            "selected_reason": selected.reason,
+            **extra,
+        }
         self._diag_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
     @staticmethod
@@ -476,9 +565,16 @@ class CnnPathNode(Node):
         )
         self._main_pub.publish(path_message(bundle.main, message.header))
         self._shortcut_pub.publish(path_message(published_shortcut, message.header))
+        selected_route = self._route_logic.route_intent
+        selected_path = select_route_value(
+            selected_route,
+            bundle.main,
+            published_shortcut,
+        )
+        published_selected = self._publish_center(selected_path, message.header)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         payload = {
-            "ok": bool(bundle.main.usable),
+            "ok": bool(published_selected.usable),
             "model_kind": self._path_model.model_kind,
             "main": {
                 "usable": bundle.main.usable,
@@ -497,6 +593,12 @@ class CnnPathNode(Node):
                 ),
                 "availability_source": bundle.shortcut_availability_source,
             },
+            "route_intent": selected_route,
+            "selected_route": selected_route,
+            "selected_usable": published_selected.usable,
+            "selected_reason": published_selected.reason,
+            "left_streak": self._route_logic.left_streak,
+            "last_signal_sequence": self._route_logic.last_sequence,
             "camera_cells": camera_cells,
             "lidar_preprocess_mode": self._lidar_preprocess_mode,
             "lidar_preprocess": compact_diag,

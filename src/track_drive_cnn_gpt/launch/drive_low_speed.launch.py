@@ -32,14 +32,17 @@ def generate_launch_description():
 
     enable_sensors = LaunchConfiguration("enable_sensors")
     enable_motor = LaunchConfiguration("enable_motor")
-    enable_supervisor = LaunchConfiguration("enable_supervisor")
+    enable_drive_gate = LaunchConfiguration("enable_drive_gate")
     enable_drive = LaunchConfiguration("enable_drive")
     ros_domain_id = LaunchConfiguration("ros_domain_id")
 
     return LaunchDescription([
         DeclareLaunchArgument("enable_sensors", default_value="false"),
         DeclareLaunchArgument("enable_motor", default_value="false"),
-        DeclareLaunchArgument("enable_supervisor", default_value="false"),
+        # The selected path goes directly from cnn_path to cnn_motion.  This
+        # independent gate refreshes only the legacy /drive_cmd watchdog and
+        # remains explicitly disabled by default.
+        DeclareLaunchArgument("enable_drive_gate", default_value="false"),
         DeclareLaunchArgument("enable_drive", default_value="false"),
         DeclareLaunchArgument("ros_domain_id", default_value="7"),
         SetEnvironmentVariable(
@@ -70,15 +73,9 @@ def generate_launch_description():
         ),
         Node(
             package="track_drive_cnn_gpt",
-            executable="mission_route",
+            executable="cnn_drive_gate",
             output="screen",
-            parameters=[perception_config],
-        ),
-        Node(
-            package="track_drive_cnn_gpt",
-            executable="cnn_supervisor",
-            output="screen",
-            condition=IfCondition(enable_supervisor),
+            condition=IfCondition(enable_drive_gate),
             parameters=[
                 perception_config,
                 {"enable_drive": ParameterValue(enable_drive, value_type=bool)},

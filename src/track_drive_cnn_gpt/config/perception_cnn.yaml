@@ -18,23 +18,23 @@ yolo_bev_node:
     supersample: 3
     publish_debug: true
 
-mission_route_node:
-  ros__parameters:
-    signal_topic: "/perception/signals"
-    route_intent_topic: "/route_intent"
-    route_reset_topic: "/route_intent_reset"
-    # LEFT가 연속 두 추론에서 보여야 지름길로 전환한다. 한번 전환되면
-    # 명시적인 /route_intent_reset=true 전까지 유지한다.
-    left_confirm_frames: 2
-    left_confidence: 0.25
-    publish_hz: 5.0
-
 cnn_path_node:
   ros__parameters:
     bev_topic: "/perception/bev"
     scan_topic: "/scan"
+    signal_topic: "/perception/signals"
     main_path_topic: "/cnn/path_main"
     shortcut_path_topic: "/cnn/path_shortcut"
+    # cnn_path가 직접 선택해 motion 입력으로 보낸다. main/shortcut 토픽은
+    # viewer와 기록용으로만 유지하며 /center_path publisher는 하나뿐이다.
+    center_path_topic: "/center_path"
+    route_intent_topic: "/route_intent"
+    route_reset_topic: "/route_intent_reset"
+    enable_center_path: true
+    # 같은 YOLO 결과 두 번 연속 LEFT일 때만 shortcut으로 latch한다.
+    # LEFT가 사라져도 자동 복귀하지 않고 명시 reset=true만 main 복귀한다.
+    left_confirm_frames: 2
+    left_confidence: 0.25
     # 최종 학습 checkpoint의 차량 배포 경로와 고정 SHA256이다.
     model_path: "/home/xytron/xycar_ws/models/path_cnn.pt"
     expected_model_sha256: "439937eb506fe0a25c8d9f225abc2f10b4de96d388099fe4b2570598a5c03a67"
@@ -82,19 +82,46 @@ cnn_path_node:
     max_abs_slope: 3.1
     max_abs_curvature: 12.0
 
-cnn_supervisor_node:
+cnn_drive_gate_node:
   ros__parameters:
-    main_path_topic: "/cnn/path_main"
-    shortcut_path_topic: "/cnn/path_shortcut"
     center_path_topic: "/center_path"
-    route_intent_topic: "/route_intent"
+    drive_cmd_topic: "/drive_cmd"
     manual_go_topic: "/manual_go"
     emergency_stop_topic: "/emergency_stop"
     control_hz: 20.0
     path_stale_sec: 0.25
     path_future_tolerance_sec: 0.05
     path_frame_id: "lidar_frame"
-    shortcut_fallback_to_main: false
-    # false이면 STOP만 발행한다. 실차 저속 시험 때 명시적으로 true로 덮어쓴다.
+    # 경로 선택/중계는 하지 않는다. false이면 20Hz STOP만 발행한다.
     enable_drive: false
+    # 실제 주행 launch에서는 false 유지. 모터 토픽이 완전히 remap된
+    # live_pipeline_dry_run.launch.py만 true로 override한다.
+    initial_manual_go: false
     speed_cap: 6.0
+
+live_pipeline_viewer_node:
+  ros__parameters:
+    image_topic: "/image_raw"
+    bev_topic: "/perception/bev"
+    scan_topic: "/scan"
+    signal_topic: "/perception/signals"
+    motion_topic: "/debug/xycar_motor_dryrun"
+    compressed_topic: "/debug/pipeline_view/compressed"
+    render_hz: 8.0
+    show_window: true
+    publish_compressed: true
+    jpeg_quality: 75
+    camera_panel_width: 960
+    canvas_height: 720
+    bev_scale: 4
+    speed_visual_max: 10.0
+    window_name: "Xycar CNN live dry-run"
+    screenshot_dir: "/home/xytron/pipeline_view_shots_gpt"
+    # cnn_path_node와 동일한 LiDAR 변환값. viewer는 제어에 사용하지 않고
+    # raw scan이 어디에 찍히는지만 붉은 점으로 표시한다.
+    lidar_range_scale: 1.1476
+    lidar_min_range: 0.05
+    lidar_max_range: 8.0
+    lidar_self_x_abs: 0.25
+    lidar_self_y_abs: 0.15
+    lidar_radius_cells: 1

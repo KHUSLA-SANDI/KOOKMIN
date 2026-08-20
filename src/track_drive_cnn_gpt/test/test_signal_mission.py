@@ -7,9 +7,11 @@ from track_drive_cnn_gpt.signal_mission import (
     ROUTE_MAIN,
     ROUTE_SHORTCUT,
     RouteIntentLatch,
+    SequencedRouteIntentLatch,
     decode_signal_payload,
     encode_signal_payload,
     extract_signal_confidences,
+    select_route_value,
     signal_class_ids,
 )
 
@@ -70,3 +72,72 @@ def test_source_restart_clears_only_partial_confirmation():
     assert latch.observe({"LEFT": 0.9}) == ROUTE_SHORTCUT
     latch.reset_observation_streak()
     assert latch.route_intent == ROUTE_SHORTCUT
+
+
+def test_sequence_duplicate_cannot_create_a_false_two_hit_confirmation():
+    latch = SequencedRouteIntentLatch(
+        left_confirm_frames=2,
+        left_confidence=0.5,
+    )
+
+    first = latch.observe(10, {"LEFT": 0.9})
+    duplicate = latch.observe(10, {"LEFT": 0.9})
+
+    assert first.accepted
+    assert not duplicate.accepted
+    assert not duplicate.route_changed
+    assert latch.left_streak == 1
+    assert latch.route_intent == ROUTE_MAIN
+    assert latch.observe(11, {"LEFT": 0.9}).route_intent == ROUTE_SHORTCUT
+
+
+def test_sequence_restart_clears_partial_streak_but_not_latched_shortcut():
+    partial = SequencedRouteIntentLatch(
+        left_confirm_frames=2,
+        left_confidence=0.5,
+    )
+    partial.observe(100, {"LEFT": 0.9})
+
+    restarted = partial.observe(1, {"LEFT": 0.9})
+    assert restarted.accepted
+    assert restarted.source_restarted
+    assert not restarted.route_changed
+    assert partial.left_streak == 1
+    assert partial.route_intent == ROUTE_MAIN
+    assert partial.observe(2, {"LEFT": 0.9}).route_intent == ROUTE_SHORTCUT
+
+    still_shortcut = partial.observe(1, {})
+    assert still_shortcut.source_restarted
+    assert partial.route_intent == ROUTE_SHORTCUT
+
+
+def test_sequence_reset_is_explicit_and_clears_sequence_epoch():
+    latch = SequencedRouteIntentLatch(left_confirm_frames=2)
+    latch.observe(8, {"LEFT": 0.9})
+    latch.observe(9, {"LEFT": 0.9})
+    assert latch.route_intent == ROUTE_SHORTCUT
+
+    assert latch.reset_main() == ROUTE_MAIN
+    assert latch.last_sequence == -1
+    assert latch.left_streak == 0
+    assert latch.observe(1, {"LEFT": 0.9}).route_intent == ROUTE_MAIN
+
+
+@pytest.mark.parametrize("sequence", [True, -1, 1.5, "1"])
+def test_sequence_wrapper_rejects_invalid_sequence(sequence):
+    latch = SequencedRouteIntentLatch()
+    with pytest.raises(ValueError, match="sequence"):
+        latch.observe(sequence, {})
+
+
+def test_route_selection_never_falls_back_from_unavailable_shortcut():
+    main = object()
+    unavailable_shortcut = object()
+
+    assert select_route_value(ROUTE_MAIN, main, unavailable_shortcut) is main
+    assert (
+        select_route_value(ROUTE_SHORTCUT, main, unavailable_shortcut)
+        is unavailable_shortcut
+    )
+    with pytest.raises(ValueError, match="unsupported route"):
+        select_route_value("unknown", main, unavailable_shortcut)

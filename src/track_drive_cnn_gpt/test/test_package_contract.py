@@ -26,6 +26,10 @@ def test_package_xml_and_installed_config_patterns():
         '"cnn_motion = track_drive_cnn_gpt.motion_cnn_node:main"'
         in setup_text
     )
+    assert (
+        '"live_pipeline_viewer = track_drive_cnn_gpt.live_pipeline_viewer_node:main"'
+        in setup_text
+    )
 
 
 def test_runtime_grid_config_is_the_frozen_contract():
@@ -81,6 +85,8 @@ def test_live_path_only_launch_has_sensors_and_perception_but_no_drive_chain():
     assert 'DeclareLaunchArgument("enable_imu", default_value="false")' in text
     for forbidden in (
         'executable="cnn_supervisor"',
+        'executable="cnn_drive_gate"',
+        'executable="mission_route"',
         'executable="cnn_motion"',
         'executable="motion"',
         "dynamic_bridge",
@@ -95,6 +101,9 @@ def test_low_speed_launch_uses_isolated_cnn_motion_overlay():
     )
     assert 'package="track_drive_cnn_gpt"' in text
     assert 'executable="cnn_motion"' in text
+    assert 'executable="cnn_drive_gate"' in text
+    assert 'executable="cnn_supervisor"' not in text
+    assert 'executable="mission_route"' not in text
     assert 'executable="motion"' not in text
 
 
@@ -119,13 +128,15 @@ def test_motion_overlay_is_pinned_to_the_audited_vehicle_source():
     assert config["lookahead_x_max"] == 3.0
 
 
-def test_supervisor_requires_source_frame_and_timestamp_policy():
+def test_drive_gate_requires_source_frame_and_timestamp_policy():
     config = yaml.safe_load(
         (ROOT / "config" / "perception_cnn.yaml").read_text(encoding="utf-8")
-    )["cnn_supervisor_node"]["ros__parameters"]
+    )["cnn_drive_gate_node"]["ros__parameters"]
     assert config["path_frame_id"] == "lidar_frame"
     assert config["path_stale_sec"] == 0.25
     assert config["path_future_tolerance_sec"] == 0.05
+    assert config["enable_drive"] is False
+    assert config["initial_manual_go"] is False
 
 
 def test_camera_does_not_respawn_forever_on_device_busy():
@@ -133,20 +144,27 @@ def test_camera_does_not_respawn_forever_on_device_busy():
     assert "respawn=False" in text
 
 
-def test_rectangular_openvino_and_signal_mission_contract_are_configured():
+def test_rectangular_openvino_and_direct_signal_selection_are_configured():
     config = yaml.safe_load(
         (ROOT / "config" / "perception_cnn.yaml").read_text(encoding="utf-8")
     )
     yolo = config["yolo_bev_node"]["ros__parameters"]
-    mission = config["mission_route_node"]["ros__parameters"]
+    cnn = config["cnn_path_node"]["ros__parameters"]
+    gate = config["cnn_drive_gate_node"]["ros__parameters"]
     assert yolo["imgsz"] == [384, 640]
     assert yolo["signal_topic"] == "/perception/signals"
-    assert mission["signal_topic"] == yolo["signal_topic"]
-    assert mission["route_intent_topic"] == "/route_intent"
-    assert mission["left_confirm_frames"] >= 2
+    assert cnn["signal_topic"] == yolo["signal_topic"]
+    assert cnn["center_path_topic"] == "/center_path"
+    assert cnn["left_confirm_frames"] >= 2
+    assert cnn["enable_center_path"] is True
+    assert gate["center_path_topic"] == cnn["center_path_topic"]
+    assert gate["enable_drive"] is False
 
     setup_text = (ROOT / "setup.py").read_text(encoding="utf-8")
-    assert "mission_route = track_drive_cnn_gpt.mission_route_node:main" in setup_text
+    assert "cnn_drive_gate = track_drive_cnn_gpt.drive_gate_node:main" in setup_text
+    assert "mission_route = track_drive_cnn_gpt.mission_route_node:main" not in setup_text
+    assert "cnn_supervisor = track_drive_cnn_gpt.supervisor_node:main" not in setup_text
+    assert "signal_preview = track_drive_cnn_gpt.signal_preview_node:main" not in setup_text
 
 
 def test_all_yolo_inference_entrypoints_force_static_batch_one():
@@ -163,11 +181,52 @@ def test_all_yolo_inference_entrypoints_force_static_batch_one():
 def test_all_ros_nodes_guard_shutdown_after_launch_sigint():
     paths = (
         "yolo_bev_node.py",
-        "mission_route_node.py",
         "cnn_path_node.py",
-        "supervisor_node.py",
+        "drive_gate_node.py",
         "motion_cnn_node.py",
+        "live_pipeline_viewer_node.py",
     )
     for name in paths:
         source = (ROOT / "track_drive_cnn_gpt" / name).read_text(encoding="utf-8")
         assert "if rclpy.ok():" in source, name
+
+
+def test_obsolete_route_nodes_and_signal_only_viewer_are_removed():
+    runtime = ROOT / "track_drive_cnn_gpt"
+    tests = ROOT / "test"
+    for obsolete in (
+        runtime / "mission_route_node.py",
+        runtime / "supervisor_node.py",
+        runtime / "signal_preview_node.py",
+        tests / "test_supervisor_logic.py",
+        tests / "test_signal_preview.py",
+    ):
+        assert not obsolete.exists(), obsolete
+    gate_source = (runtime / "drive_gate_node.py").read_text(encoding="utf-8")
+    assert "from .supervisor_node" not in gate_source
+    assert "def encode_drive_command" in gate_source
+
+
+def test_live_dry_run_uses_real_motion_with_hard_motor_topic_isolation():
+    source = (ROOT / "launch" / "live_pipeline_dry_run.launch.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'executable="yolo_bev"' in source
+    assert 'executable="cnn_path"' in source
+    assert 'executable="cnn_drive_gate"' in source
+    assert 'executable="cnn_motion"' in source
+    assert 'executable="live_pipeline_viewer"' in source
+    assert '("/drive_cmd", "/debug/drive_cmd_dryrun")' in source
+    assert '("/teleop_cmd", "/debug/teleop_cmd_dryrun")' in source
+    assert '("/xycar_motor", "/debug/xycar_motor_dryrun")' in source
+    assert '"initial_manual_go": True' in source
+    assert 'executable="car_state"' not in source
+    assert "dynamic_bridge" not in source
+    assert "motor_up" not in source
+
+    viewer = (
+        ROOT / "track_drive_cnn_gpt" / "live_pipeline_viewer_node.py"
+    ).read_text(encoding="utf-8")
+    assert '"/debug/xycar_motor_dryrun"' in viewer
+    assert "create_publisher(\n            CompressedImage" in viewer
+    assert "create_publisher(\n            Float32MultiArray" not in viewer

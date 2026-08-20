@@ -80,6 +80,8 @@ class ReplayPreviewNode(Node):
         self._bev_stamp = -1
         self._main = np.empty((0, 2), np.float32)
         self._shortcut = np.empty((0, 2), np.float32)
+        self._selected = np.empty((0, 2), np.float32)
+        self._route_intent = "unknown"
         self._diag = "waiting for CNN"
         self._writer = None
         self._written = 0
@@ -89,6 +91,8 @@ class ReplayPreviewNode(Node):
         self.create_subscription(Image, "/perception/bev", self._on_bev, SENSOR_QOS_LATEST)
         self.create_subscription(PoseArray, "/cnn/path_main", self._on_main, 10)
         self.create_subscription(PoseArray, "/cnn/path_shortcut", self._on_shortcut, 10)
+        self.create_subscription(PoseArray, "/center_path", self._on_selected, 10)
+        self.create_subscription(String, "/route_intent", self._on_route_intent, 10)
         self.create_subscription(String, "/debug/cnn_path", self._on_diag, 10)
         self._timer = self.create_timer(1.0 / self._fps, self._write_frame)
         self.get_logger().info(f"Replay preview: {self._output_path}")
@@ -126,6 +130,7 @@ class ReplayPreviewNode(Node):
             if stamp != self._bev_stamp:
                 self._main = np.empty((0, 2), np.float32)
                 self._shortcut = np.empty((0, 2), np.float32)
+                self._selected = np.empty((0, 2), np.float32)
             self._bev_stamp = stamp
 
     @staticmethod
@@ -145,9 +150,21 @@ class ReplayPreviewNode(Node):
             if _stamp_ns(message.header) == self._bev_stamp:
                 self._shortcut = self._poses(message)
 
+    def _on_selected(self, message: PoseArray) -> None:
+        with self._lock:
+            if _stamp_ns(message.header) == self._bev_stamp:
+                self._selected = self._poses(message)
+
+    def _on_route_intent(self, message: String) -> None:
+        intent = str(message.data).strip().casefold() or "unknown"
+        with self._lock:
+            self._route_intent = intent
+
     def _on_diag(self, message: String) -> None:
+        route_intent = None
         try:
             payload = json.loads(message.data)
+            route_intent = payload.get("route_intent")
             if payload.get("ok"):
                 main = payload.get("main", {})
                 shortcut = payload.get("shortcut", {})
@@ -163,8 +180,16 @@ class ReplayPreviewNode(Node):
             text = "CNN diagnostic parse error"
         with self._lock:
             self._diag = text
+            if isinstance(route_intent, str) and route_intent.strip():
+                self._route_intent = route_intent.strip().casefold()
 
-    def _bev_panel(self, bev: np.ndarray, main: np.ndarray, shortcut: np.ndarray) -> np.ndarray:
+    def _bev_panel(
+        self,
+        bev: np.ndarray,
+        main: np.ndarray,
+        shortcut: np.ndarray,
+        selected: np.ndarray,
+    ) -> np.ndarray:
         height, width = bev.shape[:2]
         semantic = np.zeros((height, width, 3), dtype=np.uint8)
         yellow = bev[:, :, 0] > 0
@@ -174,7 +199,12 @@ class ReplayPreviewNode(Node):
 
         x_max = GRID_X_BOUNDS_M[1]
         y_max = GRID_Y_BOUNDS_M[1]
-        for points, color in ((main, (40, 255, 40)), (shortcut, (255, 80, 255))):
+        for points, color, thickness in (
+            (main, (40, 255, 40), 2),
+            (shortcut, (255, 80, 255), 2),
+            # Draw last so the path actually sent on /center_path is obvious.
+            (selected, (255, 255, 0), 3),
+        ):
             pixels = []
             for x, y in points:
                 row = int(np.floor((x_max - float(x)) / GRID_RESOLUTION_M))
@@ -187,7 +217,7 @@ class ReplayPreviewNode(Node):
                     [np.asarray(pixels, dtype=np.int32)],
                     False,
                     color,
-                    2,
+                    thickness,
                     cv2.LINE_AA,
                 )
             elif pixels:
@@ -206,6 +236,8 @@ class ReplayPreviewNode(Node):
             bev = self._bev.copy()
             main = self._main.copy()
             shortcut = self._shortcut.copy()
+            selected = self._selected.copy()
+            route_intent = self._route_intent
             diagnostic = self._diag
 
         camera_panel = cv2.resize(
@@ -213,7 +245,7 @@ class ReplayPreviewNode(Node):
             (self._camera_width, self._canvas_height),
             interpolation=cv2.INTER_AREA,
         )
-        bev_image = self._bev_panel(bev, main, shortcut)
+        bev_image = self._bev_panel(bev, main, shortcut, selected)
         right_width = bev_image.shape[1]
         canvas = np.full(
             (self._canvas_height, self._camera_width + right_width, 3),
@@ -235,12 +267,22 @@ class ReplayPreviewNode(Node):
         )
         cv2.putText(
             canvas,
-            "BEV: yellow/white | main=green | shortcut=magenta",
+            "BEV: main=green | shortcut=magenta | selected=cyan",
             (self._camera_width + 8, 20),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.42,
             (220, 220, 220),
             1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            f"route={route_intent} | selected={len(selected)} pts",
+            (14, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 0),
+            2,
             cv2.LINE_AA,
         )
 

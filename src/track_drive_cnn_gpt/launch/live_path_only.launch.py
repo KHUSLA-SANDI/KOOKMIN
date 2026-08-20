@@ -74,13 +74,6 @@ def generate_launch_description():
         ),
         Node(
             package="track_drive_cnn_gpt",
-            executable="mission_route",
-            output="screen",
-            condition=IfCondition(enable_yolo),
-            parameters=[config_path],
-        ),
-        Node(
-            package="track_drive_cnn_gpt",
             executable="cnn_path",
             output="screen",
             condition=IfCondition(enable_cnn),

@@ -115,8 +115,9 @@ class CnnMotionNode(VehicleMotionNode):
             return
 
         # An older delayed DDS sample must not erase a newer valid path.  Equal
-        # stamps are expected because the supervisor republishes at 20 Hz; they
-        # retain the original source time and therefore cannot refresh age.
+        # stamps are accepted so an explicit empty invalidation (for example a
+        # route reset) can clear the currently cached path without pretending
+        # that the old camera observation is new.
         if source_ns < self._cnn_last_source_ns:
             self.get_logger().warning(
                 "discarding out-of-order CNN path", throttle_duration_sec=1.0

@@ -29,11 +29,10 @@ setup(
     entry_points={
         "console_scripts": [
             "yolo_bev = track_drive_cnn_gpt.yolo_bev_node:main",
-            "signal_preview = track_drive_cnn_gpt.signal_preview_node:main",
             "cnn_path = track_drive_cnn_gpt.cnn_path_node:main",
-            "mission_route = track_drive_cnn_gpt.mission_route_node:main",
-            "cnn_supervisor = track_drive_cnn_gpt.supervisor_node:main",
+            "cnn_drive_gate = track_drive_cnn_gpt.drive_gate_node:main",
             "cnn_motion = track_drive_cnn_gpt.motion_cnn_node:main",
+            "live_pipeline_viewer = track_drive_cnn_gpt.live_pipeline_viewer_node:main",
             "replay_images = track_drive_cnn_gpt.replay_source_node:main_images",
             "replay_clean_scan = track_drive_cnn_gpt.replay_source_node:main_clean_scan",
             "replay_recorder = track_drive_cnn_gpt.replay_recorder_node:main",

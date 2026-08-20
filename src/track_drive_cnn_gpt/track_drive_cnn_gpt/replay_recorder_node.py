@@ -46,6 +46,12 @@ class ReplayRecorderNode(Node):
         self._shortcut_stamps: list[int] = []
         self._main_valid_stamps: list[int] = []
         self._shortcut_valid_stamps: list[int] = []
+        self._selected_stamps: list[int] = []
+        self._selected_valid_stamps: list[int] = []
+        self._route_intent = "unknown"
+        self._route_intent_counts: dict[str, int] = {}
+        self._route_intent_messages = 0
+        self._route_intent_transitions = 0
         self._yolo_inference_ms: list[float] = []
         self._yolo_total_ms: list[float] = []
         self._cnn_total_ms: list[float] = []
@@ -56,6 +62,8 @@ class ReplayRecorderNode(Node):
         self.create_subscription(
             PoseArray, "/cnn/path_shortcut", self._on_shortcut, 10
         )
+        self.create_subscription(PoseArray, "/center_path", self._on_selected, 10)
+        self.create_subscription(String, "/route_intent", self._on_route_intent, 10)
         self.create_subscription(
             String, "/diagnostics/yolo_bev_timing", self._on_yolo_diag, 10
         )
@@ -120,6 +128,33 @@ class ReplayRecorderNode(Node):
             self._shortcut_valid_stamps.append(stamp)
         self._write("path_shortcut", **self._path_payload(message))
 
+    def _on_selected(self, message: PoseArray) -> None:
+        stamp = _stamp_ns(message.header)
+        self._selected_stamps.append(stamp)
+        if message.poses:
+            self._selected_valid_stamps.append(stamp)
+        self._write(
+            "path_selected",
+            route_intent=self._route_intent,
+            **self._path_payload(message),
+        )
+
+    def _on_route_intent(self, message: String) -> None:
+        intent = str(message.data).strip().casefold() or "unknown"
+        previous = self._route_intent
+        changed = intent != previous
+        if changed and previous != "unknown":
+            self._route_intent_transitions += 1
+        self._route_intent = intent
+        self._route_intent_messages += 1
+        self._route_intent_counts[intent] = self._route_intent_counts.get(intent, 0) + 1
+        self._write(
+            "route_intent",
+            route_intent=intent,
+            previous_route_intent=previous,
+            changed=changed,
+        )
+
     @staticmethod
     def _decode_payload(message: String) -> dict:
         try:
@@ -181,7 +216,7 @@ class ReplayRecorderNode(Node):
 
     def _summary(self) -> dict:
         return {
-            "schema": "track_drive_replay_summary_v1_gpt",
+            "schema": "track_drive_replay_summary_v2_gpt",
             "output_path": str(self._output_path),
             "started_wall_time": self._started_wall,
             "duration_sec": round(time.monotonic() - self._started_mono, 3),
@@ -189,13 +224,22 @@ class ReplayRecorderNode(Node):
             "valid_path_counts": {
                 "main": len(self._main_valid_stamps),
                 "shortcut": len(self._shortcut_valid_stamps),
+                "selected": len(self._selected_valid_stamps),
             },
             # Message rate includes explicit empty paths used for fail-closed
             # STOP.  Valid-path rate counts only non-empty CNN outputs.
             "main_path_hz": self._rate(self._main_stamps),
             "shortcut_path_hz": self._rate(self._shortcut_stamps),
+            "selected_path_hz": self._rate(self._selected_stamps),
             "main_valid_path_hz": self._rate(self._main_valid_stamps),
             "shortcut_valid_path_hz": self._rate(self._shortcut_valid_stamps),
+            "selected_valid_path_hz": self._rate(self._selected_valid_stamps),
+            "route_intent": {
+                "last": self._route_intent,
+                "messages": self._route_intent_messages,
+                "transitions": self._route_intent_transitions,
+                "counts": dict(self._route_intent_counts),
+            },
             "yolo_inference": self._latency(self._yolo_inference_ms),
             "yolo_receive_to_bev": self._latency(self._yolo_total_ms),
             "cnn_total": self._latency(self._cnn_total_ms),
@@ -208,6 +252,8 @@ class ReplayRecorderNode(Node):
         self.get_logger().info(
             "replay metrics "
             f"main={summary['event_counts'].get('path_main', 0)} "
+            f"selected={summary['event_counts'].get('path_selected', 0)} "
+            f"route={summary['route_intent']['last']} "
             f"cnn_ok={summary['cnn_ok']} "
             f"path_hz={summary['main_path_hz']}"
         )

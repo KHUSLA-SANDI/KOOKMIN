@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 import numpy as np
@@ -19,6 +20,17 @@ SIGNAL_SCHEMA = "yolo_signal_v1_gpt"
 SIGNAL_NAMES = ("GREEN", "LEFT", "RED", "YELLOW")
 ROUTE_MAIN = "main"
 ROUTE_SHORTCUT = "shortcut"
+
+
+def select_route_value(route_intent: str, main: Any, shortcut: Any) -> Any:
+    """Return exactly the requested route without an implicit fallback."""
+
+    normalized = str(route_intent).strip().lower()
+    if normalized == ROUTE_MAIN:
+        return main
+    if normalized == ROUTE_SHORTCUT:
+        return shortcut
+    raise ValueError(f"unsupported route intent: {route_intent!r}")
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -184,3 +196,75 @@ class RouteIntentLatch:
         """Forget partial confirmation without changing a latched route."""
 
         self.left_streak = 0
+
+
+@dataclass(frozen=True)
+class SequencedRouteObservation:
+    """Result of applying one sequence-numbered YOLO signal observation."""
+
+    accepted: bool
+    source_restarted: bool
+    route_changed: bool
+    route_intent: str
+
+
+class SequencedRouteIntentLatch:
+    """Sequence-aware wrapper around :class:`RouteIntentLatch`.
+
+    Keeping this state machine ROS-independent prevents a duplicated DDS sample
+    from counting as two LEFT confirmations.  A lower sequence denotes a YOLO
+    source restart and clears only an unfinished confirmation streak; an
+    already-latched shortcut remains selected until ``reset_main`` is called.
+    """
+
+    def __init__(
+        self,
+        *,
+        left_confirm_frames: int = 2,
+        left_confidence: float = 0.25,
+    ) -> None:
+        self._latch = RouteIntentLatch(
+            left_confirm_frames=left_confirm_frames,
+            left_confidence=left_confidence,
+        )
+        self.last_sequence = -1
+
+    @property
+    def route_intent(self) -> str:
+        return self._latch.route_intent
+
+    @property
+    def left_streak(self) -> int:
+        return self._latch.left_streak
+
+    def observe(
+        self,
+        sequence: int,
+        signals: Mapping[str, float] | Iterable[str],
+    ) -> SequencedRouteObservation:
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ValueError("signal sequence must be a non-negative integer")
+        if sequence == self.last_sequence:
+            return SequencedRouteObservation(
+                accepted=False,
+                source_restarted=False,
+                route_changed=False,
+                route_intent=self.route_intent,
+            )
+
+        source_restarted = sequence < self.last_sequence
+        if source_restarted:
+            self._latch.reset_observation_streak()
+        self.last_sequence = sequence
+        before = self.route_intent
+        after = self._latch.observe(signals)
+        return SequencedRouteObservation(
+            accepted=True,
+            source_restarted=source_restarted,
+            route_changed=after != before,
+            route_intent=after,
+        )
+
+    def reset_main(self) -> str:
+        self.last_sequence = -1
+        return self._latch.reset_main()
