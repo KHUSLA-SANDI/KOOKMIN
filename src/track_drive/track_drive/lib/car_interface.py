@@ -5,7 +5,7 @@
 입력: 논리 조향 angle_cmd(예선 ±100 스케일), 논리 속도 speed_cmd(명령단위, ×0.08=m/s).
 출력: /xycar_motor Float32MultiArray data=[angle_out, speed_out]에 그대로 넣을 값.
 예선 대비 변경점: 신규 파일. 예선은 시뮬 모터라 변환 없이 직접 발행했음 —
-  실차 실측값(직진 트림 -20, 기계 스톱 -32~+62, 데드존 4, 센서리스 램프 필수)을
+  실차 실측값(기계 스톱 -32~+62, 데드존 4, 센서리스 램프 필수)을
   여기서 전부 흡수한다. 스무딩 상태는 이 클래스 내부에만 존재 (재도입 금지 버그 1 대응
   — 외부에서 _prev 상태를 직접 오염시킬 수 없다).
 
@@ -24,10 +24,13 @@ import math
 # ============================================================
 
 DEFAULT_CFG = {
-    "steer_trim": -20.0,          # 직진 트림 (실측: 명령 -20이 직진)
-    "steer_scale": 0.42,          # 논리 조향(±100) → 기계 조향 스케일
-    "steer_limit_left": -32.0,    # 트림 기준 상대 좌 스톱 (실측 -34, 마진 포함)
-    "steer_limit_right": 62.0,    # 트림 기준 상대 우 스톱 (실측 +64, 마진 포함)
+    # 영점 보정은 ROS1 xycar_motor의 steering_calibration.yaml이 전담한다.
+    "steer_trim": 0.0,
+    # 보정 영점 +1.952 기준: 논리 -100/+100 → VESC 0.0/1.0.
+    "steer_scale_left": 0.625933146,
+    "steer_scale_right": 0.585923661,
+    "steer_limit_left": -62.593314622,
+    "steer_limit_right": 58.592366078,
     "slew_angle_per_tick": 8.0,   # 틱당 조향 출력 변화 상한
     "slew_speed_per_tick": 1.5,   # 틱당 속도 출력 변화 상한 (센서리스 기동 램프)
     "speed_deadzone": 4.0,        # 이 미만 명령은 안 구름 (실측)
@@ -50,7 +53,18 @@ class CarInterface:
     def __init__(self, cfg=None):
         cfg = cfg or {}
         self.steer_trim = float(cfg.get("steer_trim", DEFAULT_CFG["steer_trim"]))
-        self.steer_scale = float(cfg.get("steer_scale", DEFAULT_CFG["steer_scale"]))
+        # steer_scale 하나만 넘기는 옛 호출자는 좌우 공통 스케일로 호환한다.
+        legacy_scale = cfg.get("steer_scale")
+        if legacy_scale is None:
+            self.steer_scale_left = float(cfg.get(
+                "steer_scale_left", DEFAULT_CFG["steer_scale_left"]))
+            self.steer_scale_right = float(cfg.get(
+                "steer_scale_right", DEFAULT_CFG["steer_scale_right"]))
+        else:
+            self.steer_scale_left = float(cfg.get(
+                "steer_scale_left", legacy_scale))
+            self.steer_scale_right = float(cfg.get(
+                "steer_scale_right", legacy_scale))
         self.steer_limit_left = float(
             cfg.get("steer_limit_left", DEFAULT_CFG["steer_limit_left"]))
         self.steer_limit_right = float(
@@ -110,8 +124,7 @@ class CarInterface:
             speed_cmd = 0.0   # 정지
 
         # --- 조향: 스케일 → 기계 스톱 클램프(트림 기준 상대) → 트림 → slew ---
-        rel = _clamp(angle_cmd * self.steer_scale,
-                     self.steer_limit_left, self.steer_limit_right)
+        rel = self.steering_relative(angle_cmd)
         angle_out = self.steer_trim + rel
         if self._last_angle_out is not None:
             angle_out = _clamp(angle_out,
@@ -131,6 +144,21 @@ class CarInterface:
         self._last_angle_out = float(angle_out)
         self._last_speed_out = float(speed_out)
         return self._last_angle_out, self._last_speed_out
+
+    def steering_relative(self, angle_cmd):
+        """Convert logical steering to a centre-relative motor input."""
+        angle_cmd = float(angle_cmd)
+        scale = (self.steer_scale_left if angle_cmd < 0.0
+                 else self.steer_scale_right)
+        return _clamp(angle_cmd * scale,
+                      self.steer_limit_left, self.steer_limit_right)
+
+    def steering_logical(self, angle_out):
+        """Inverse steering conversion used when controller ownership changes."""
+        relative = float(angle_out) - self.steer_trim
+        scale = (self.steer_scale_left if relative < 0.0
+                 else self.steer_scale_right)
+        return relative / max(scale, 1e-9)
 
     def _snap_deadzone(self, v):
         """0 < |v| < deadzone 인 안 구르는 명령을 스냅.

@@ -33,25 +33,25 @@ class TestSteer:
         # angle_cmd=0 → rel=0 → 출력은 트림 그대로
         ci = make()
         angle, _ = ci.to_motor(0.0, 0.0)
-        assert angle == pytest.approx(-20.0)
+        assert angle == pytest.approx(0.0)
 
     def test_scale_then_trim(self):
-        # rel = 10 × 0.42 = 4.2 → out = -20 + 4.2
+        # 양수 입력은 오른쪽 전용 스케일을 사용한다.
         ci = make()
         angle, _ = ci.to_motor(10.0, 0.0)
-        assert angle == pytest.approx(-20.0 + 4.2)
+        assert angle == pytest.approx(10.0 * DEFAULT_CFG["steer_scale_right"])
 
     def test_asymmetric_clamp_left(self):
-        # 좌측 풀조향: rel이 -32로 클램프 → out = -52 (트림 기준 상대)
+        # 좌측 풀조향: rel이 -32로 클램프
         ci = make()
         angle, _ = ci.to_motor(-1000.0, 0.0)
-        assert angle == pytest.approx(-20.0 - 32.0)
+        assert angle == pytest.approx(DEFAULT_CFG["steer_limit_left"])
 
     def test_asymmetric_clamp_right(self):
-        # 우측 풀조향: rel이 +62로 클램프 → out = +42
+        # 우측 풀조향: rel이 +62로 클램프
         ci = make()
         angle, _ = ci.to_motor(1000.0, 0.0)
-        assert angle == pytest.approx(-20.0 + 62.0)
+        assert angle == pytest.approx(DEFAULT_CFG["steer_limit_right"])
 
     def test_clamp_is_relative_to_trim(self):
         # 트림을 바꾸면 절대 출력 한계도 같이 이동해야 한다
@@ -59,8 +59,17 @@ class TestSteer:
         left, _ = ci.to_motor(-1000.0, 0.0)
         ci.reset()
         right, _ = ci.to_motor(1000.0, 0.0)
-        assert left == pytest.approx(-32.0)
-        assert right == pytest.approx(62.0)
+        assert left == pytest.approx(DEFAULT_CFG["steer_limit_left"])
+        assert right == pytest.approx(DEFAULT_CFG["steer_limit_right"])
+
+    def test_logical_endpoints_use_full_vesc_range(self):
+        ci = make()
+        left, _ = ci.to_motor(-100.0, 0.0)
+        ci.reset()
+        right, _ = ci.to_motor(100.0, 0.0)
+        assert left == pytest.approx(DEFAULT_CFG["steer_limit_left"])
+        assert right == pytest.approx(DEFAULT_CFG["steer_limit_right"])
+        assert ci.steering_logical(right) == pytest.approx(100.0)
 
 
 # ============================================================
@@ -118,26 +127,28 @@ class TestSlew:
         ci = CarInterface()
         # 첫 틱: 기준 출력이 없어 slew 미적용 → 우측 풀조향 즉시
         angle, _ = ci.to_motor(1000.0, 0.0)
-        assert angle == pytest.approx(42.0)
-        # 둘째 틱: 좌측 풀조향(-52) 요청해도 틱당 8만 이동
+        right = DEFAULT_CFG["steer_limit_right"]
+        assert angle == pytest.approx(right)
+        # 둘째 틱: 좌측 풀조향 요청도 틱당 8만 이동
         angle, _ = ci.to_motor(-1000.0, 0.0)
-        assert angle == pytest.approx(42.0 - 8.0)
+        assert angle == pytest.approx(right - 8.0)
         angle, _ = ci.to_motor(-1000.0, 0.0)
-        assert angle == pytest.approx(42.0 - 16.0)
+        assert angle == pytest.approx(right - 16.0)
 
     def test_angle_slew_both_directions(self):
         ci = CarInterface()
-        ci.to_motor(0.0, 0.0)                     # 기준: -20
+        ci.to_motor(0.0, 0.0)                     # 기준: 0
         angle, _ = ci.to_motor(1000.0, 0.0)       # +방향 상한
-        assert angle == pytest.approx(-20.0 + 8.0)
+        assert angle == pytest.approx(8.0)
         angle, _ = ci.to_motor(-1000.0, 0.0)      # -방향 상한
-        assert angle == pytest.approx(-20.0)
+        assert angle == pytest.approx(0.0)
 
     def test_angle_within_slew_not_altered(self):
         ci = CarInterface()
-        ci.to_motor(0.0, 0.0)                     # 기준: -20
-        angle, _ = ci.to_motor(10.0, 0.0)         # 목표 -15.8, 변화 4.2 < 8
-        assert angle == pytest.approx(-15.8)
+        ci.to_motor(0.0, 0.0)                     # 기준: 0
+        angle, _ = ci.to_motor(10.0, 0.0)         # 변화 약 5.86 < 8
+        assert angle == pytest.approx(
+            10.0 * DEFAULT_CFG["steer_scale_right"])
 
     def test_speed_ramps_from_standstill(self):
         # 센서리스: 정지→고속 직행 불가. 0부터 틱당 1.5씩 램프
@@ -185,7 +196,7 @@ class TestResetAndState:
         assert ci.last_speed_out == pytest.approx(0.0)
         # reset 후: 조향은 첫 틱 자유, 속도는 0부터 다시 램프
         angle, speed = ci.to_motor(-1000.0, 100.0)
-        assert angle == pytest.approx(-52.0)
+        assert angle == pytest.approx(DEFAULT_CFG["steer_limit_left"])
         assert speed == pytest.approx(1.5)
 
 
@@ -208,16 +219,19 @@ class TestMisc:
         # NaN 입력이 slew 상태를 오염시키면 이후 출력이 전부 NaN이 된다 (버그 1 계열)
         ci = CarInterface()
         angle, speed = ci.to_motor(float("nan"), float("inf"))
-        assert angle == pytest.approx(-20.0)      # 직진 치환
+        assert angle == pytest.approx(0.0)        # 직진 치환
         assert speed == pytest.approx(0.0)        # 정지 치환
         angle, speed = ci.to_motor(10.0, 10.0)
-        assert angle == pytest.approx(-15.8)
+        assert angle == pytest.approx(
+            10.0 * DEFAULT_CFG["steer_scale_right"])
         assert speed == pytest.approx(1.5)
 
     def test_cfg_defaults_match_spec(self):
-        assert DEFAULT_CFG["steer_trim"] == -20.0
-        assert DEFAULT_CFG["steer_limit_left"] == -32.0
-        assert DEFAULT_CFG["steer_limit_right"] == 62.0
+        assert DEFAULT_CFG["steer_trim"] == 0.0
+        assert DEFAULT_CFG["steer_scale_left"] == pytest.approx(0.625933146)
+        assert DEFAULT_CFG["steer_scale_right"] == pytest.approx(0.585923661)
+        assert DEFAULT_CFG["steer_limit_left"] == pytest.approx(-62.593314622)
+        assert DEFAULT_CFG["steer_limit_right"] == pytest.approx(58.592366078)
         assert DEFAULT_CFG["speed_deadzone"] == 4.0
         assert DEFAULT_CFG["cmd_to_ms"] == 0.08
         assert DEFAULT_CFG["allow_reverse"] is False

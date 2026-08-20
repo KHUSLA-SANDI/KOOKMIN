@@ -130,6 +130,11 @@ class YoloNode(Node):
         # 차체 가림선 — 이 v 아래는 라이다 원통/범퍼라 지면이 아니다. 안 자르면
         # 차체 화소가 BEV 에서 x≈0.1~0.2m 의 가짜 차선점으로 들어온다.
         self._car_mask_v = self._cam["car_mask_v"]
+        # ★ 차선을 원본으로 볼지 (기본 켬). 끄면 예전처럼 보정영상을 본다.
+        self.declare_parameter("lane_on_raw", True)
+        self._lane_on_raw = bool(self.get_parameter("lane_on_raw").value)
+        self._new_K_cfg = None
+        self._cm_rows_raw = None
         self._log_camera_summary(camera_yaml)
 
         # ── 모델 로드 (스위치 꺼진 모델은 로드 자체를 생략 — CPU/메모리 절약) ──
@@ -306,11 +311,23 @@ class YoloNode(Node):
             self._log_camera_summary(
                 str(self.get_parameter("camera_yaml").value))
         frame = self._undist.apply(bgr)
+        if self._lane_on_raw and self._new_K_cfg is None:
+            import numpy as _np
+            nk = self._cam.get("new_K")
+            self._new_K_cfg = _np.asarray(
+                nk if nk is not None else self._undist.new_K, _np.float64
+            ).reshape(3, 3)
+            self._cm_rows_raw = bev.car_mask_rows_raw(
+                self._car_mask_v, self._cam["K"], self._cam["D"],
+                self._new_K_cfg, (bgr.shape[1], bgr.shape[0]),
+                self._cam.get("h_model"))
+            self.get_logger().info(
+                "[lane] 원본 프레임으로 추론한다 (검출점만 펴서 지면 변환)")
 
         t_lane = t_obj = t_light = 0.0
         if self._model_lane is not None:
             t = time.perf_counter()
-            self._run_lane(frame, msg.header)
+            self._run_lane(frame, msg.header, raw=bgr)
             t_lane = time.perf_counter() - t
         if self._model_obj is not None:
             t = time.perf_counter()
@@ -345,7 +362,16 @@ class YoloNode(Node):
 
     # ---------------- 차선 (lane.pt seg) ----------------
 
-    def _run_lane(self, frame, header):
+    def _run_lane(self, frame, header, raw=None):
+        """★ 차선만 **원본**을 본다.
+
+        모델을 원본으로 학습시켰고(녹화 원본과 학습 사진 md5 동일), 사진을 펴서
+        넣으면 out_fx 때문에 좌우가 잘리거나(원본의 65%) 물체가 작아져 먼 점선을
+        놓친다. 검출된 점만 나중에 펴서 지면으로 보낸다 — 결과는 수학적으로 같다.
+        물체/신호등 모델은 u,v 임계값이 보정영상 기준으로 맞춰져 있어 그대로 둔다.
+        """
+        use_raw = raw is not None and self._lane_on_raw
+        frame = raw if use_raw else frame
         img = frame[:, :, ::-1] if MODEL_WANTS_RGB["lane"] else frame
         results = self._model_lane.predict(
             np.ascontiguousarray(img), conf=self._conf_lane, imgsz=self._imgsz,
@@ -383,10 +409,15 @@ class YoloNode(Node):
                     binmask[m > 0.5] = 255
                 # 차체(라이다 원통/범퍼) 영역 제거 — BEV 워프 전에 잘라야 한다.
                 # 캘리브 기준 높이를 넘겨 프레임 크기가 달라도 비율 환산되게 한다.
-                bev.apply_car_mask(binmask, self._car_mask_v,
-                                   calib_h=self._undist_size[1])
-                # 이미지픽셀 마스크 → BEV 워프 → 라이다 좌표 중심점 (검증된 lib 경로)
-                xs, ys = bev.mask_to_bev_points(binmask, self._cam["H"])
+                if use_raw:
+                    bev.apply_car_mask_raw(binmask, self._cm_rows_raw)
+                    xs, ys = bev.raw_mask_to_bev_points(
+                        binmask, self._cam["H"], self._cam["K"], self._cam["D"],
+                        self._new_K_cfg, self._cam.get("h_model"))
+                else:
+                    bev.apply_car_mask(binmask, self._car_mask_v,
+                                       calib_h=self._undist_size[1])
+                    xs, ys = bev.mask_to_bev_points(binmask, self._cam["H"])
                 for x, y in zip(xs, ys):
                     p = Pose()
                     p.position.x = float(x)

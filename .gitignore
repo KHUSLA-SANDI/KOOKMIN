@@ -1,0 +1,27 @@
+# ROS 2 generated workspaces
+build/
+install/
+log/
+
+# Vendor desktop/manual/VESC assets (not source code)
+etc/
+
+# Runtime model artifacts stay on the vehicle; do not publish weights by accident
+models/
+
+# Local pre-cleanup archives are recoverable on the vehicle but not source
+archive/
+
+# Python/test/editor caches
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/*.egg-info/
+
+# Local calibration backups; canonical values live in config/*.yaml
+**/config/backup_gpt/
+
+# Runtime captures and temporary files
+*.tmp
+*.log

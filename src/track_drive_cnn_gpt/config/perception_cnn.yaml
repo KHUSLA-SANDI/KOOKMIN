@@ -1,0 +1,100 @@
+yolo_bev_node:
+  ros__parameters:
+    image_topic: "/image_raw"
+    bev_topic: "/perception/bev"
+    signal_topic: "/perception/signals"
+    # 배포 시 실제 install 경로로 바꾼다. OpenVINO 검증 후에는 *_openvino_model 폴더.
+    model_path: "/home/xytron/xycar_ws/models/best_0817_openvino_model"
+    expected_model_sha256: "5d14778ed36ecc089fb5373d32c16a1a58c816faf05a925ec2647a93fd2d1cc9"
+    camera_yaml: "/home/xytron/xycar_ws/install/track_drive_cnn_gpt/share/track_drive_cnn_gpt/config/camera.yaml"
+    # 1920x1080의 기존 PyTorch imgsz=640 auto-letterbox 실제 텐서와 동일.
+    # OpenVINO export manifest도 반드시 static [384,640]이어야 한다.
+    imgsz: [384, 640]
+    conf: 0.25
+    signal_conf: 0.25
+    iou: 0.70
+    device: "cpu"
+    cv_threads: 4
+    supersample: 3
+    publish_debug: true
+
+mission_route_node:
+  ros__parameters:
+    signal_topic: "/perception/signals"
+    route_intent_topic: "/route_intent"
+    route_reset_topic: "/route_intent_reset"
+    # LEFT가 연속 두 추론에서 보여야 지름길로 전환한다. 한번 전환되면
+    # 명시적인 /route_intent_reset=true 전까지 유지한다.
+    left_confirm_frames: 2
+    left_confidence: 0.25
+    publish_hz: 5.0
+
+cnn_path_node:
+  ros__parameters:
+    bev_topic: "/perception/bev"
+    scan_topic: "/scan"
+    main_path_topic: "/cnn/path_main"
+    shortcut_path_topic: "/cnn/path_shortcut"
+    # 최종 학습 checkpoint의 차량 배포 경로와 고정 SHA256이다.
+    model_path: "/home/xytron/xycar_ws/models/path_cnn.pt"
+    expected_model_sha256: "439937eb506fe0a25c8d9f225abc2f10b4de96d388099fe4b2570598a5c03a67"
+    device: "cpu"
+    torch_threads: 2
+    allow_unverified_legacy: false
+    lidar_range_scale: 1.1476
+    lidar_min_range: 0.05
+    lidar_max_range: 8.0
+    # 학습 ego footprint 0.50x0.30m의 반폭/반길이. 목요일 실차에서 LiDAR
+    # origin 기준 실제 footprint와 self-return 위치를 반드시 다시 측정한다.
+    lidar_self_x_abs: 0.25
+    lidar_self_y_abs: 0.15
+    lidar_radius_cells: 1
+    # 학습 8,391건에는 두 카메라 채널이 동시에 빈 샘플이 없다.
+    min_camera_cells: 1
+    # clean LiDAR는 0 cells, obstacle 합성 학습 분포는 정확히 27~67 cells다.
+    # 중간값을 임계값에 억지로 맞추지 않고 이 범위를 벗어나면 STOP한다.
+    min_lidar_cells: 27
+    max_lidar_cells: 67
+    # 1차 CNN(라이다=0)으로 곡선 기준경로를 얻고, 그 회랑 안의 단일 소형
+    # 클러스터만 학습과 같은 3~14개의 희소 hit로 만든 뒤 장애물이 있을 때만
+    # 2차 CNN을 실행한다. 벽/복수 물체/희소 반사는 모두 fail-closed다.
+    lidar_preprocess_mode: "compact_reference"
+    lidar_fov_deg: 110.0
+    lidar_corridor_half_width_m: 0.70
+    lidar_cluster_gap_base_m: 0.12
+    lidar_cluster_gap_per_m: 0.03
+    lidar_min_cluster_points: 3
+    lidar_max_cluster_extent_m: 0.72
+    lidar_max_clusters: 1
+    # BEV header는 카메라 callback 도착시각이다. 실차 flash 측정 전에는 0으로 둔다.
+    camera_to_scan_offset_sec: 0.0
+    sync_slop_sec: 0.18
+    scan_history_sec: 1.0
+    require_fresh_scan: true
+    # 카메라 수신 시각 기준. 이보다 오래된 BEV는 추론하지 않고 fail-closed 한다.
+    max_bev_age_sec: 0.35
+    valid_threshold: 0.50
+    shortcut_threshold: 0.50
+    min_valid_points: 6
+    min_valid_span_m: 0.50
+    # GT 범위/p99: |y|<=1.5, shortcut slope=3.078, curvature=11.187.
+    max_abs_y_m: 1.500001
+    max_abs_slope: 3.1
+    max_abs_curvature: 12.0
+
+cnn_supervisor_node:
+  ros__parameters:
+    main_path_topic: "/cnn/path_main"
+    shortcut_path_topic: "/cnn/path_shortcut"
+    center_path_topic: "/center_path"
+    route_intent_topic: "/route_intent"
+    manual_go_topic: "/manual_go"
+    emergency_stop_topic: "/emergency_stop"
+    control_hz: 20.0
+    path_stale_sec: 0.25
+    path_future_tolerance_sec: 0.05
+    path_frame_id: "lidar_frame"
+    shortcut_fallback_to_main: false
+    # false이면 STOP만 발행한다. 실차 저속 시험 때 명시적으로 true로 덮어쓴다.
+    enable_drive: false
+    speed_cap: 6.0

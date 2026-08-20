@@ -39,7 +39,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import (QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy,
                        QoSDurabilityPolicy)
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, LaserScan
 from std_msgs.msg import Bool, Float32MultiArray
 
 from .lib import bev
@@ -75,6 +75,11 @@ class RecorderNode(Node):
         self.declare_parameter("start_recording", False)
         # 저장이 이만큼 연속 실패하면 녹화를 멈춘다 (조용히 빈 파일만 쌓이는 것 방지)
         self.declare_parameter("fail_abort", 20)
+        # ★ 라이다도 같이 녹화한다. 장애물이 BEV 에서 어떻게 찍히는지 알아야
+        #   합성 장애물을 실제와 비슷하게 만들 수 있다 (지금은 근거가 없다).
+        self.declare_parameter("record_scan", True)
+        # 사진은 빼고 라이다만 — 장애물 모양만 볼 때 가볍게 쓴다
+        self.declare_parameter("scan_only", False)
 
         g = lambda k: self.get_parameter(k).value
         self.out_root = os.path.expanduser(str(g("out_dir")))
@@ -120,7 +125,15 @@ class RecorderNode(Node):
         img_qos = QoSProfile(depth=1, history=QoSHistoryPolicy.KEEP_LAST,
                              reliability=QoSReliabilityPolicy.BEST_EFFORT,
                              durability=QoSDurabilityPolicy.VOLATILE)
-        self.create_subscription(Image, "/image_raw", self._on_image, img_qos)
+        self._rec_scan = bool(self.get_parameter("record_scan").value)
+        self._scan_only = bool(self.get_parameter("scan_only").value)
+        self._scan_f = None
+        self._scan_n = 0
+        self._scan_last = None
+        if not self._scan_only:
+            self.create_subscription(Image, "/image_raw", self._on_image, img_qos)
+        if self._rec_scan or self._scan_only:
+            self.create_subscription(LaserScan, "/scan", self._on_scan, img_qos)
         self.create_subscription(Bool, "/record_toggle", self._on_toggle, 10)
         self.create_subscription(Float32MultiArray, "/teleop_cmd", self._on_teleop, 10)
         self.create_subscription(Float32MultiArray, "/xycar_motor", self._on_motor, 10)
@@ -188,6 +201,11 @@ class RecorderNode(Node):
             self._csv = open(os.path.join(self._dir, "frames.csv"), "w",
                              encoding="utf-8")
             self._csv.write("idx,file,stamp_sec,wall_sec,angle,speed,estop,cmd_src\n")
+            if self._rec_scan or self._scan_only:
+                # 한 줄에 스캔 하나. 거리는 cm 정수로 줄여 파일을 가볍게 한다
+                self._scan_f = open(os.path.join(self._dir, "scan.jsonl"), "w",
+                                    encoding="utf-8")
+                self._scan_n = 0
         except OSError as e:
             self.get_logger().error(f"녹화 파일을 열 수 없다: {e}")
             self._dir = None
@@ -212,6 +230,36 @@ class RecorderNode(Node):
         self.get_logger().info(
             f"● 녹화 시작 → {self._dir}  (여유 {free:.1f}GB)")
 
+    def _on_scan(self, msg):
+        """라이다 한 스캔. 녹화 중이면 그대로 한 줄 적는다.
+
+        ranges 를 cm 정수로 저장한다 — 1도 간격 500빔이면 한 줄 3KB 쯤이라
+        10Hz 로 몇 분 찍어도 부담이 없다. 무한/음수는 0 으로 둔다.
+        """
+        self._scan_last = msg
+        if not self._rec or self._scan_f is None:
+            return
+        try:
+            import json
+            r = np.asarray(msg.ranges, np.float32)
+            r = np.where(np.isfinite(r) & (r > 0.0), r, 0.0)
+            row = {
+                "i": self._scan_n,
+                "stamp": float(msg.header.stamp.sec) + msg.header.stamp.nanosec * 1e-9,
+                "wall": round(time.time(), 3),
+                "a0": round(float(msg.angle_min), 6),
+                "da": round(float(msg.angle_increment), 8),
+                "rmin": round(float(msg.range_min), 3),
+                "rmax": round(float(msg.range_max), 3),
+                "angle": round(float(self._angle), 1),
+                "speed": round(float(self._speed), 1),
+                "cm": np.round(r * 100.0).astype(np.int32).tolist(),
+            }
+            self._scan_f.write(json.dumps(row, separators=(",", ":")) + "\n")
+            self._scan_n += 1
+        except Exception as e:                       # noqa: BLE001
+            self.get_logger().warn(f"스캔 저장 실패: {e}", throttle_duration_sec=5.0)
+
     def _stop_rec(self):
         self._rec = False
         # 큐에 남은 것을 다 쓸 때까지 잠깐 기다린다 (마지막 몇 장이 날아가지 않게)
@@ -227,10 +275,18 @@ class RecorderNode(Node):
             except OSError:
                 pass
             self._csv = None
+        if self._scan_f:
+            try:
+                self._scan_f.flush()
+                self._scan_f.close()
+            except OSError:
+                pass
+            self._scan_f = None
 
         self._write_meta(dur)
         saved = self._idx - self._fail
-        msg = (f"■ 녹화 정지 — 저장 {saved}장 / {dur:.1f}초 "
+        scan_msg = f"  라이다 {self._scan_n}스캔" if self._scan_n else ""
+        msg = (f"■ 녹화 정지 — 저장 {saved}장{scan_msg} / {dur:.1f}초 "
                f"({saved / dur:.1f}fps) / {self._bytes / 1048576.0:.0f}MB "
                f"→ {self._dir}")
         if self._dropped:
@@ -254,6 +310,7 @@ class RecorderNode(Node):
                 f.write(f"failed: {self._fail}\n")
                 f.write(f"duration_sec: {dur:.2f}\n")
                 f.write(f"effective_fps: {self._idx / dur:.2f}\n")
+                f.write(f"scans: {self._scan_n}\n")
                 f.write(f"rec_fps_setting: {self.rec_fps:g}\n")
                 f.write(f"jpeg_quality: {self.jpeg_q}\n")
                 f.write(f"undistorted: {str(self.do_undist).lower()}\n")

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Same-host camera traffic uses SHM; remote debugging remains UDP allow-listed. -->
+<dds>
+  <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_local</transport_id>
+        <type>SHM</type>
+        <!-- 1920x1080 rgb8 Image is about 6.22 MiB.  Fast DDS 2.6's
+             small default segment is not sufficient for this stream. -->
+        <segment_size>134217728</segment_size>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>lan_only_udp</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+          <address>192.168.50.1</address>
+          <address>10.42.0.1</address>
+          <address>172.17.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="shm_lan_gpt" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_local</transport_id>
+          <transport_id>lan_only_udp</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

@@ -1,0 +1,40 @@
+motion_node:
+  ros__parameters:
+    control_hz: 20.0
+
+    # 2026-08-19 차량 최신 motion source checksum. CNN 래퍼는 설치된
+    # track_drive를 덮지 않고 상속하며, 이 값이 달라지면 재감사 전 fail-closed.
+    expected_vehicle_motion_sha256: "1f2d3e6c2ea58073f0c6d917d587109d4055f4f6ec20153fb511c94d6cad089e"
+    verify_vehicle_motion_source: true
+    cnn_path_frame_id: "lidar_frame"
+    path_future_tolerance_sec: 0.05
+
+    # CNN 출력은 ego-relative absolute x=0.3~3.0m. cnn_motion 래퍼가
+    # legacy nearest-point reanchor/rel_s를 제거해 아래 값이 실제 x(m)가 된다.
+    lookahead_x_min: 0.3
+    lookahead_x_max: 3.0
+    steer_focus_base: 1.0
+    steer_focus_k: 0.020
+    steer_focus_min: 0.8
+    steer_focus_max: 2.0
+    steer_focus_sigma: 0.70
+    steer_gain_distance_m: 1.0
+    steer_preview_distance_m: 2.0
+    preview_distance_m: 2.0
+
+    # 첫 바닥 시험용 보수값. 내일 실차에서 조정해야 한다.
+    curve_pursuit_gain: 0.45
+    curve_heading_gain: 0.60
+    straight_pursuit_gain: 0.08
+    straight_heading_gain: 0.08
+    angle_smooth_alpha: 0.45
+    angle_max_step: 9.0
+    angle_deadband: 0.8
+
+    speed_default: 6.0
+    speed_curve_base: 5.5
+    speed_min: 5.0
+    speed_min_drive: 5.0
+    preview_slow_speed: 5.0
+    path_stale_sec: 0.25
+    lane_lost_decel_sec: 0.60

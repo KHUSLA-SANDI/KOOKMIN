@@ -1,0 +1,28 @@
+# 2026-08-18 최종 카메라/지면 캘리브레이션.
+# 중요: H는 raw 픽셀용이 아니다.
+# raw distorted pixel --(K,D,new_K)--> undistorted new_K pixel --(H)--> lidar_frame ground metre
+camera:
+  image_width: 1920
+  image_height: 1080
+  model: plumb_bob
+  calibrated: true
+  intrinsics_calibrated: true
+  h_calibrated: true
+  h_frame: lidar_frame
+  K:
+    - [789.0055173669999, 0.0, 972.7561126664001]
+    - [0.0, 874.5620217124001, 543.2523301648]
+    - [0.0, 0.0, 1.0]
+  D: [-0.369976, 0.11051, 0.001014, 0.000505, 0.0]
+  new_K:
+    - [617.5228556633, 0.0, 960.0]
+    - [0.0, 684.4844873895914, 540.0]
+    - [0.0, 0.0, 1.0]
+  H:
+    - [2.1364560347993087e-06, -0.0009087816430540701, 1.417699091289356]
+    - [-0.0016193560153475847, 4.456960887386543e-06, 1.5556378361679124]
+    - [2.803799310148954e-05, 0.00724648209677677, -3.3098876571923417]
+  # undistorted new_K 영상에서 이 행 아래는 차체이므로 BEV로 보내지 않는다.
+  car_mask_v: 951.4285714285714
+  calibration_source: "tools/ground_fit.py physical model, 2026-08-18"
+

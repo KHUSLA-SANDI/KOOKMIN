@@ -1,0 +1,53 @@
+replay_image_node:
+  ros__parameters:
+    source_path: "/home/xytron/recordings/20260818_211400"
+    image_topic: "/image_raw"
+    frame_id: "camera_optical_frame"
+    fps: 30.0
+    # auto: frames.csv/scan.jsonl가 있으면 녹화 wall 시간과 실측 LiDAR를
+    # 함께 재생하고, scan.jsonl이 없으면 빈 장애물 스캔을 보낸다.
+    playback_rate: 1.0
+    scan_mode: "auto"
+    recorded_scan_path: ""
+    scan_topic: "/scan"
+    lidar_frame_id: "lidar_frame"
+    clean_scan_rate_hz: 10.0
+    clean_scan_sample_count: 720
+    clean_scan_range_min: 0.05
+    clean_scan_range_max: 8.0
+    loop: true
+    start_index: 0
+    max_frames: 0
+    expected_width: 1920
+    expected_height: 1080
+    startup_guard_sec: 1.5
+    fail_if_other_publisher: true
+    status_period_frames: 30
+    exit_when_done: false
+
+replay_clean_scan_node:
+  ros__parameters:
+    scan_topic: "/scan"
+    frame_id: "lidar_frame"
+    rate_hz: 10.0
+    sample_count: 720
+    range_min: 0.05
+    range_max: 8.0
+    startup_guard_sec: 1.5
+    fail_if_other_publisher: true
+
+replay_recorder_node:
+  ros__parameters:
+    output_path: "/tmp/track_drive_replay_gpt.jsonl"
+    overwrite: false
+    record_path_points: true
+    log_period_sec: 5.0
+
+replay_preview_node:
+  ros__parameters:
+    output_path: "/tmp/track_drive_replay_preview_gpt.mp4"
+    overwrite: false
+    video_fps: 10.0
+    camera_panel_width: 960
+    canvas_height: 540
+    bev_scale: 4

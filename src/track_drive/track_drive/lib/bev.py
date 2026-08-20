@@ -462,6 +462,136 @@ def _mask_to_centerline_xy(mask):
     return out_x[order], out_y[order]
 
 
+# ================== 원본 픽셀에서 바로 지면으로 (사진을 펴지 않는다) ==================
+# ★ 왜 이 경로가 필요한가
+#   예전에는 사진 전체를 undistort 한 뒤 YOLO 에 넣었다. 그런데
+#     · YOLO 는 **원본**으로 학습했다 (녹화 원본 md5 와 학습 사진이 동일)
+#     · undistort 결과를 같은 1920x1080 에 담으려면 out_fx 로 확대/축소해야 하는데,
+#       확대하면 좌우가 잘리고(원본의 65%만 남았다), 축소하면 물체가 작아져
+#       먼 점선을 YOLO 가 못 잡는다 (실측: 검출거리 1.40m → 1.07m)
+#   사진 전체를 펼 이유가 없다. **검출된 점 몇백 개만** 펴서 H 에 넣으면
+#   결과는 수학적으로 같고, 화각도 해상도도 하나도 안 잃는다.
+
+
+def undistort_pixels(us, vs, K, D, new_K, model=None):
+    """원본 픽셀 → 보정영상 픽셀. 사진이 아니라 **점만** 편다."""
+    us = np.asarray(us, np.float64).ravel()
+    vs = np.asarray(vs, np.float64).ravel()
+    if us.size == 0:
+        return np.empty((0, 2), np.float64)
+    pts = np.stack([us, vs], 1).reshape(-1, 1, 2)
+    K = np.asarray(K, np.float64).reshape(3, 3)
+    nk = np.asarray(new_K, np.float64).reshape(3, 3)
+    mdl, _ = resolve_distortion_model(model, D)
+    if mdl == MODEL_FISHEYE:
+        d = _coerce_D(D, 4)[:4].reshape(4, 1)
+        out = cv2.fisheye.undistortPoints(pts, K, d, np.eye(3), nk)
+    else:
+        out = cv2.undistortPoints(pts, K, _coerce_D(D, 5), None, np.eye(3), nk)
+    return out.reshape(-1, 2)
+
+
+def pixels_to_ground(us, vs, H):
+    """보정영상 픽셀 → 지면 (x 전방, y 좌) 미터."""
+    us = np.asarray(us, np.float64).ravel()
+    vs = np.asarray(vs, np.float64).ravel()
+    if us.size == 0:
+        return np.array([]), np.array([])
+    q = np.asarray(H, np.float64) @ np.stack([us, vs, np.ones_like(us)], 0)
+    w = q[2]
+    ok = np.abs(w) > 1e-9
+    w = np.where(ok, w, 1.0)
+    x = np.where(ok, q[0] / w, np.nan)
+    y = np.where(ok, q[1] / w, np.nan)
+    return x, y
+
+
+def centerline_from_ground(xs, ys, bin_m=LANE_CENTERLINE_BIN_M):
+    """지면 점 무리 → x 칸마다 중앙값 하나. (_mask_to_centerline_xy 와 같은 규칙)"""
+    xs = np.asarray(xs, np.float64)
+    ys = np.asarray(ys, np.float64)
+    ok = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[ok], ys[ok]
+    if xs.size == 0:
+        return np.array([], np.float32), np.array([], np.float32)
+    bins = np.floor(xs / bin_m).astype(np.int64)
+    ox, oy = [], []
+    for bid in np.unique(bins):
+        m = bins == bid
+        if int(np.count_nonzero(m)) < 2:
+            continue
+        ox.append(float(np.median(xs[m])))
+        oy.append(float(np.median(ys[m])))
+    if not ox:
+        return np.array([], np.float32), np.array([], np.float32)
+    ox = np.asarray(ox, np.float32)
+    oy = np.asarray(oy, np.float32)
+    o = np.argsort(ox)
+    return ox[o], oy[o]
+
+
+def raw_mask_to_bev_points(mask, H, K, D, new_K, model=None,
+                           subsample=LANE_PIX_SUBSAMPLE):
+    """**원본(왜곡 있는) 마스크** → 지면 차선 중심점 (xs, ys).
+
+    mask 는 YOLO 가 원본 프레임에서 낸 이진 마스크다. 사진을 펴지 않았으므로
+    화각도 해상도도 그대로다.
+    """
+    if mask is None or mask.size == 0:
+        return np.array([], np.float32), np.array([], np.float32)
+    vs, us = np.where(mask > 0)
+    if vs.size == 0:
+        return np.array([], np.float32), np.array([], np.float32)
+    if subsample > 1:
+        vs = vs[::subsample]
+        us = us[::subsample]
+    uv = undistort_pixels(us, vs, K, D, new_K, model)
+    x, y = pixels_to_ground(uv[:, 0], uv[:, 1], H)
+    # ★ 반드시 잘라야 한다. 지평선 근처 화소는 지면에서 수백 m 로 튄다
+    #   (옛 경로는 BEV 캔버스가 대신 잘라 줬다 — 실측 최대 186m 가 나왔다).
+    ok = (np.isfinite(x) & np.isfinite(y)
+          & (x >= BEV_X_MIN) & (x <= BEV_X_MAX) & (np.abs(y) <= BEV_Y_HALF))
+    return centerline_from_ground(x[ok], y[ok])
+
+
+def car_mask_rows_raw(car_mask_v, K, D, new_K, size, model=None):
+    """보정영상의 차체 가림선(v) 이 **원본에서는 어느 행**인가 — 열마다 다르다.
+
+    보정영상의 가로선은 원본에서 휘어 있으므로 한 줄이 아니라 곡선이 된다.
+    반환: 길이 W 의 배열. 그 열에서 이 행 이후는 차체다.
+    """
+    if car_mask_v is None:
+        return None
+    W, Hh = int(size[0]), int(size[1])
+    K = np.asarray(K, np.float64).reshape(3, 3)
+    nk = np.asarray(new_K, np.float64).reshape(3, 3)
+    d = _coerce_D(D, 5)
+    us = np.arange(W, dtype=np.float64)
+    vs = np.full(W, float(car_mask_v), np.float64)
+    xn = (us - nk[0, 2]) / nk[0, 0]
+    yn = (vs - nk[1, 2]) / nk[1, 1]
+    r2 = xn * xn + yn * yn
+    k1, k2, p1, p2, k3 = (list(np.asarray(d).ravel()) + [0.0] * 5)[:5]
+    rad = 1.0 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    xd = xn * rad + 2 * p1 * xn * yn + p2 * (r2 + 2 * xn * xn)
+    yd = yn * rad + p1 * (r2 + 2 * yn * yn) + 2 * p2 * xn * yn
+    v_raw = K[1, 1] * yd + K[1, 2]
+    return np.clip(v_raw, 0, Hh)
+
+
+def apply_car_mask_raw(mask, rows):
+    """원본 마스크에서 차체 영역(열마다 다른 가림선 아래)을 0 으로."""
+    if mask is None or mask.size == 0 or rows is None:
+        return mask
+    Hh, W = mask.shape[:2]
+    r = np.asarray(rows, np.float64)
+    if r.size != W:
+        r = np.interp(np.linspace(0, 1, W), np.linspace(0, 1, r.size), r)
+    keep = np.arange(Hh, dtype=np.float64)[:, None] < r[None, :]
+    mask[~keep] = 0
+    return mask
+
+
 def car_mask_row(car_mask_v, frame_h, calib_h=None):
     """차체 가림선 v → 현재 프레임 높이 기준의 행 인덱스. 자를 게 없으면 None.
 

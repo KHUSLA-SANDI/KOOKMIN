@@ -33,7 +33,8 @@ class VescRelay(object):
         # ---------------- 파라미터 ----------------
         self.deadman_enable = rospy.get_param("~deadman_enable", False)
         self.deadman_timeout = rospy.get_param("~deadman_timeout", 0.4)  # /xycar_motor 침묵 판정
-        self.steer_trim = rospy.get_param("~steer_trim", -20.0)          # 트림상당 정지 조향 (실측)
+        # 실제 영점 오프셋은 하위 xycar_motor 노드가 일괄 적용한다.
+        self.steer_trim = rospy.get_param("~steer_trim", 0.0)
         self.tick_hz = rospy.get_param("~tick_hz", 20.0)                 # 데드맨 검사/발행 주기
 
         # ---------------- 상태 (데드맨) ----------------

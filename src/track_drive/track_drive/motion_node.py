@@ -436,9 +436,9 @@ class MotionNode(Node):
         if lao is None:
             self._prev_angle = 0.0
         else:
-            # 기계 발행각 → 논리각 역변환 (트림 제거 후 스케일 역산)
+            # 기계 발행각 → 논리각 역변환 (좌우별 스케일 역산)
             self._prev_angle = float(np.clip(
-                (lao - self._car.steer_trim) / max(self._car.steer_scale, 1e-6),
+                self._car.steering_logical(lao),
                 ANGLE_MIN, ANGLE_MAX))
         self._corner_frames = 0
         self._straight_ticks = 0

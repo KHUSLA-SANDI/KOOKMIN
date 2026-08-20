@@ -9,8 +9,15 @@
     뿐이다. 실제로 남의 조종기가 쏘는 /joy 가 우리 ros1_bridge 로 들어와
     우리 차를 움직였다. 반대로 우리 명령도 남의 차를 움직였을 것이다.
 
-  여기 적은 주소로만 통신한다 (없는 주소는 그냥 무시되니 안전하다)
-    127.0.0.1     차 안 (노드끼리 — 우리 노드는 전부 차에서 돈다)
+  ★ 공유메모리(SHM)를 반드시 같이 열어둘 것
+    Fast-DDS 기본 전송은 UDPv4 + SHM 이다. useBuiltinTransports 를 false 로
+    하면 그 기본이 통째로 꺼지므로, UDP 만 남기면 같은 컴퓨터 안 통신까지
+    UDP 루프백으로 간다. /image_raw 는 1920x1080 rgb8 = 한 장 6.22MB 라
+    조각내고 합치는 비용이 그대로 지연이 된다. SHM 은 호스트 안에서만 도는
+    전송이라 외부 차단과 무관하다 — 켜둬도 남의 차가 못 들어온다.
+
+  UDP 는 아래 주소로만 통신한다 (없는 주소는 그냥 무시되니 안전하다)
+    127.0.0.1     차 안 (SHM 이 안 되는 경우 대비)
     192.168.50.1  노트북 직결 랜선  ← 이건 살려야 rqt/rviz 를 노트북에서 본다
     10.42.0.1     차 자체 핫스팟
     172.17.0.1    도커 (ROS1 컨테이너)
@@ -19,6 +26,13 @@
 <dds>
   <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
     <transport_descriptors>
+      <!-- 같은 컴퓨터 안 통신 — 대용량 이미지가 여기로 간다 -->
+      <transport_descriptor>
+        <transport_id>shm_local</transport_id>
+        <type>SHM</type>
+      </transport_descriptor>
+
+      <!-- 밖으로 나가는 통신 — 허용된 주소로만 -->
       <transport_descriptor>
         <transport_id>lan_only_udp</transport_id>
         <type>UDPv4</type>
@@ -34,6 +48,7 @@
     <participant profile_name="lan_only" is_default_profile="true">
       <rtps>
         <userTransports>
+          <transport_id>shm_local</transport_id>
           <transport_id>lan_only_udp</transport_id>
         </userTransports>
         <useBuiltinTransports>false</useBuiltinTransports>

@@ -112,9 +112,9 @@ class LiveViewer(Node):
         self.declare_parameter("cluster_min_pts", 2)
         self.declare_parameter("obs_r_max", 0.6)
         # 조향 표시용 — car.yaml 과 같은 값이어야 화면이 실제와 맞는다
-        self.declare_parameter("steer_trim", -20.0)
-        self.declare_parameter("steer_limit_left", -32.0)
-        self.declare_parameter("steer_limit_right", 62.0)
+        self.declare_parameter("steer_trim", 0.0)
+        self.declare_parameter("steer_limit_left", -62.593314622)
+        self.declare_parameter("steer_limit_right", 58.592366078)
         # 발행 조향을 화면 화살표 각도로 바꿀 때 쓰는 최대 시각각(도).
         # 기계값→실제 바퀴각 환산은 실측이 없어서, "한계 대비 몇 %" 를 각도로 보여준다.
         self.declare_parameter("steer_view_max_deg", 32.0)

@@ -61,10 +61,12 @@ class TeleopNode(Node):
         self.declare_parameter("watchdog_sec", 0.0)
 
         # ---------------- CarInterface 파라미터 (car.yaml 공유 — motion과 동일 키) ----------------
-        self.declare_parameter("steer_trim", -20.0)        # 직진 트림 (실측)
-        self.declare_parameter("steer_scale", 0.42)        # 논리(±100)→기계 조향 스케일
-        self.declare_parameter("steer_limit_left", -32.0)  # 트림 기준 좌 스톱 (실측 -34, 마진)
-        self.declare_parameter("steer_limit_right", 62.0)  # 트림 기준 우 스톱 (실측 +64, 마진)
+        # 영점은 ROS1 xycar_motor의 calibration 파일에서 일괄 적용한다.
+        self.declare_parameter("steer_trim", 0.0)
+        self.declare_parameter("steer_scale_left", 0.625933146)
+        self.declare_parameter("steer_scale_right", 0.585923661)
+        self.declare_parameter("steer_limit_left", -62.593314622)
+        self.declare_parameter("steer_limit_right", 58.592366078)
         self.declare_parameter("slew_angle_per_tick", 8.0)
         self.declare_parameter("slew_speed_per_tick", 1.5)  # 센서리스 기동 램프 (예선 teleop과 동일)
         self.declare_parameter("speed_deadzone", 4.0)      # 이 미만 명령은 안 구름 (실측)
@@ -81,13 +83,16 @@ class TeleopNode(Node):
         self.watchdog_sec = float(p("watchdog_sec"))
 
         cfg = {k: p(k) for k in (
-            "steer_trim", "steer_scale", "steer_limit_left", "steer_limit_right",
+            "steer_trim", "steer_scale_left", "steer_scale_right",
+            "steer_limit_left", "steer_limit_right",
             "slew_angle_per_tick", "slew_speed_per_tick", "speed_deadzone",
             "allow_reverse", "cmd_to_ms")}
         self.car = CarInterface(cfg)
         # 논리 조향 키 상태 한계 — 기계 스톱을 논리 단위로 환산 (한계 탐색 가능하도록)
-        self.steer_lo = self.car.steer_limit_left / self.car.steer_scale
-        self.steer_hi = self.car.steer_limit_right / self.car.steer_scale
+        self.steer_lo = (
+            self.car.steer_limit_left / self.car.steer_scale_left)
+        self.steer_hi = (
+            self.car.steer_limit_right / self.car.steer_scale_right)
 
         # ---------------- 조향 단계 테이블 ----------------
         n = int(p("steer_steps"))
@@ -98,11 +103,10 @@ class TeleopNode(Node):
         self.steer_steps = n
         self.steer_mid = (n + 1) // 2          # 1-based 중앙 칸 번호 (5단계면 3)
         half = self.steer_mid - 1              # 중앙에서 끝까지 몇 칸인가
-        # 좌우 기계 스톱이 비대칭이라(좌 -32 / 우 +62) 각 방향을 따로 등분한다.
+        # 좌우 VESC 끝점이 조금 비대칭이라 각 방향을 따로 등분한다.
         # 그래야 3번이 정확히 직진이고, 1번/5번이 각 방향 최대가 된다.
         # ★ 예전엔 각 방향을 "그 방향 최대까지" 등분했다. 그런데 좌우 스톱이
-        #   비대칭(좌 -32 / 우 +62, 우가 1.94배)이라 같은 칸 수인데도 우회전이
-        #   두 배로 꺾였다 — 좌 2칸(-32)이 우 1칸(+31)과 맞먹었다.
+        #   비대칭이면 같은 칸 수에서도 실제 출력 크기가 달라질 수 있다.
         #   조작이 안 맞으니 기본은 좁은 쪽(좌)에 맞춰 양쪽을 같은 크기로 나눈다.
         #   우회전 최대 성능이 필요하면 D 키가 기계 스톱까지 그대로 간다.
         self.steer_symmetric = bool(p("steer_symmetric"))
@@ -285,8 +289,7 @@ def main(args=None):
                 # mux 경유 — 기계 변환/램프는 motion측 CarInterface가 담당
                 node.send_teleop(steer, target_speed, estop)
                 # 표시용 변환만 로컬 계산 (발행값 아님)
-                rel = max(node.car.steer_limit_left,
-                          min(steer * node.car.steer_scale, node.car.steer_limit_right))
+                rel = node.car.steering_relative(steer)
                 angle_out = node.car.steer_trim + rel
                 shown_out = target_speed
 

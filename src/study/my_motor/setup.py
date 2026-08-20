@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'go = my_motor.go:main',
+            'steering_center = my_motor.steering_center:main',
+            'steering_limits = my_motor.steering_limits:main',
         ],
     },
 )

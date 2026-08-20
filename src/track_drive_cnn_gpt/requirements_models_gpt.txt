@@ -1,0 +1,10 @@
+# Install inside the existing ROS 2 / vehicle Python environment only after
+# checking its current packages.  Do not let pip replace ROS apt OpenCV.
+# PyTorch is also required, but keep the already verified vehicle build instead
+# of letting a generic requirements install replace it.
+# Exact versions verified on the vehicle on 2026-08-19.  This file records
+# the runtime contract; do not blindly pip-install it over the working ROS
+# environment.  The OpenVINO batch-1 compatibility guard in this package is
+# specifically tested against this Ultralytics release.
+ultralytics==8.3.91
+openvino==2026.3.0
