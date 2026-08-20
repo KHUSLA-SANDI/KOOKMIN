@@ -89,7 +89,7 @@ cnn_drive_gate_node:
     manual_go_topic: "/manual_go"
     emergency_stop_topic: "/emergency_stop"
     control_hz: 20.0
-    path_stale_sec: 0.25
+    path_stale_sec: 1.0
     path_future_tolerance_sec: 0.05
     path_frame_id: "lidar_frame"
     # 경로 선택/중계는 하지 않는다. false이면 20Hz STOP만 발행한다.

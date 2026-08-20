@@ -1,0 +1,14 @@
+motion_node:
+  ros__parameters:
+    # 실제 튜닝값은 이 세 개뿐이다. 첫 저속 주행에서는 gain 하나만 바꾼다.
+    lookahead_m: 1.0
+    steer_gain: 1.0
+    steer_smooth_alpha: 0.40
+
+    # 아래는 튜닝 기능이 아니라 입력·안전 계약이다.
+    control_hz: 20.0
+    path_stale_sec: 1.0
+    path_future_tolerance_sec: 0.05
+    path_frame_id: "lidar_frame"
+    expected_car_interface_sha256: "6554c716957cc93eb77b626bca3554653708b130640a6860da55d8811b889091"
+    verify_car_interface_source: true

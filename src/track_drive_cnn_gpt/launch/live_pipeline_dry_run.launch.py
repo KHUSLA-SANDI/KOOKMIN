@@ -17,7 +17,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     package_share = get_package_share_directory("track_drive_cnn_gpt")
     perception_config = os.path.join(package_share, "config", "perception_cnn.yaml")
-    motion_config = os.path.join(package_share, "config", "motion_cnn.yaml")
+    motion_config = os.path.join(package_share, "config", "simple_motion.yaml")
     sensors_launch = os.path.join(package_share, "launch", "sensors_gpt.launch.py")
     dds_profile = os.path.join(package_share, "config", "dds_shm_lan_gpt.xml")
     legacy_car_config = PathJoinSubstitution(
@@ -25,6 +25,7 @@ def generate_launch_description():
     )
 
     enable_sensors = LaunchConfiguration("enable_sensors")
+    enable_lidar = LaunchConfiguration("enable_lidar")
     enable_motion = LaunchConfiguration("enable_motion")
     show_viewer = LaunchConfiguration("show_viewer")
     ros_domain_id = LaunchConfiguration("ros_domain_id")
@@ -33,10 +34,11 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("enable_sensors", default_value="true"),
+            DeclareLaunchArgument("enable_lidar", default_value=enable_sensors),
             DeclareLaunchArgument("enable_motion", default_value="true"),
             DeclareLaunchArgument("show_viewer", default_value="true"),
             DeclareLaunchArgument("ros_domain_id", default_value="7"),
-            DeclareLaunchArgument("speed_cap", default_value="6.0"),
+            DeclareLaunchArgument("speed_cap", default_value="5.0"),
             SetEnvironmentVariable("FASTRTPS_DEFAULT_PROFILES_FILE", dds_profile),
             SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp"),
             SetEnvironmentVariable("ROS_DOMAIN_ID", ros_domain_id),
@@ -44,7 +46,7 @@ def generate_launch_description():
                 PythonLaunchDescriptionSource(sensors_launch),
                 launch_arguments={
                     "enable_camera": enable_sensors,
-                    "enable_lidar": enable_sensors,
+                    "enable_lidar": enable_lidar,
                     "enable_imu": "false",
                     "ros_domain_id": ros_domain_id,
                 }.items(),
@@ -59,7 +61,17 @@ def generate_launch_description():
                 package="track_drive_cnn_gpt",
                 executable="cnn_path",
                 output="screen",
-                parameters=[perception_config],
+                parameters=[
+                    perception_config,
+                    {
+                        # When LiDAR is disabled, run the exact clean training
+                        # contract: channel 2 stays all-zero instead of failing
+                        # closed on a missing scan.
+                        "require_fresh_scan": ParameterValue(
+                            enable_lidar, value_type=bool
+                        ),
+                    },
+                ],
             ),
             Node(
                 package="track_drive_cnn_gpt",
@@ -80,15 +92,15 @@ def generate_launch_description():
             ),
             Node(
                 package="track_drive_cnn_gpt",
-                executable="cnn_motion",
+                executable="simple_motion",
                 output="screen",
                 condition=IfCondition(enable_motion),
                 parameters=[motion_config, legacy_car_config],
-                # The real MotionNode and real steering map are used, but its
-                # command channels are unreachable by the ROS1 motor bridge.
+                # The minimal controller still uses the audited vehicle
+                # CarInterface and car.yaml, but its output cannot reach the
+                # ROS1 motor bridge in this dry run.
                 remappings=[
                     ("/drive_cmd", "/debug/drive_cmd_dryrun"),
-                    ("/teleop_cmd", "/debug/teleop_cmd_dryrun"),
                     ("/xycar_motor", "/debug/xycar_motor_dryrun"),
                 ],
             ),
@@ -103,4 +115,3 @@ def generate_launch_description():
             ),
         ]
     )
-

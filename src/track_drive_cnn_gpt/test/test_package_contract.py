@@ -11,6 +11,9 @@ INTEGRATION_ROOT = ROOT.parents[1]
 AUDITED_MOTION_SHA256 = (
     "1f2d3e6c2ea58073f0c6d917d587109d4055f4f6ec20153fb511c94d6cad089e"
 )
+AUDITED_CAR_INTERFACE_SHA256 = (
+    "6554c716957cc93eb77b626bca3554653708b130640a6860da55d8811b889091"
+)
 
 
 def test_package_xml_and_installed_config_patterns():
@@ -24,6 +27,10 @@ def test_package_xml_and_installed_config_patterns():
     assert '"requirements_models_gpt.txt"' in setup_text
     assert (
         '"cnn_motion = track_drive_cnn_gpt.motion_cnn_node:main"'
+        in setup_text
+    )
+    assert (
+        '"simple_motion = track_drive_cnn_gpt.simple_motion_node:main"'
         in setup_text
     )
     assert (
@@ -95,16 +102,51 @@ def test_live_path_only_launch_has_sensors_and_perception_but_no_drive_chain():
         assert forbidden not in text
 
 
-def test_low_speed_launch_uses_isolated_cnn_motion_overlay():
+def test_low_speed_launch_uses_minimal_motion_with_audited_car_yaml():
     text = (ROOT / "launch" / "drive_low_speed.launch.py").read_text(
         encoding="utf-8"
     )
     assert 'package="track_drive_cnn_gpt"' in text
-    assert 'executable="cnn_motion"' in text
+    assert 'executable="simple_motion"' in text
+    assert '"config", "simple_motion.yaml"' in text
+    assert "legacy_car_config" in text
+    assert 'DeclareLaunchArgument("speed_cap", default_value="5.0")' in text
     assert 'executable="cnn_drive_gate"' in text
     assert 'executable="cnn_supervisor"' not in text
     assert 'executable="mission_route"' not in text
     assert 'executable="motion"' not in text
+
+
+def test_simple_motion_has_only_three_control_tuning_values():
+    config = yaml.safe_load(
+        (ROOT / "config" / "simple_motion.yaml").read_text(encoding="utf-8")
+    )["motion_node"]["ros__parameters"]
+    assert config["lookahead_m"] == 1.0
+    assert config["steer_gain"] == 0.45
+    assert config["steer_smooth_alpha"] == 0.40
+    assert config["control_hz"] == 20.0
+    assert config["path_stale_sec"] == 0.25
+    assert config["verify_car_interface_source"] is True
+    assert config["expected_car_interface_sha256"] == AUDITED_CAR_INTERFACE_SHA256
+
+
+def test_simple_motion_uses_the_audited_vehicle_steering_calibration():
+    source = (
+        INTEGRATION_ROOT / "vehicle_snapshot_20260819_gpt" / "car_interface.py"
+    )
+    config_path = INTEGRATION_ROOT / "vehicle_snapshot_20260819_gpt" / "car.yaml"
+    if not source.is_file() or not config_path.is_file():
+        pytest.skip("audited vehicle CarInterface snapshot is not available")
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == AUDITED_CAR_INTERFACE_SHA256
+
+    car = yaml.safe_load(config_path.read_text(encoding="utf-8"))["motion_node"][
+        "ros__parameters"
+    ]
+    assert car["steer_trim"] == 0.0
+    assert car["steer_scale_left"] == pytest.approx(0.625933146)
+    assert car["steer_scale_right"] == pytest.approx(0.585923661)
+    assert car["steer_limit_left"] == pytest.approx(-62.593314622)
+    assert car["steer_limit_right"] == pytest.approx(58.592366078)
 
 
 def test_motion_overlay_is_pinned_to_the_audited_vehicle_source():
@@ -184,6 +226,7 @@ def test_all_ros_nodes_guard_shutdown_after_launch_sigint():
         "cnn_path_node.py",
         "drive_gate_node.py",
         "motion_cnn_node.py",
+        "simple_motion_node.py",
         "live_pipeline_viewer_node.py",
     )
     for name in paths:
@@ -207,17 +250,18 @@ def test_obsolete_route_nodes_and_signal_only_viewer_are_removed():
     assert "def encode_drive_command" in gate_source
 
 
-def test_live_dry_run_uses_real_motion_with_hard_motor_topic_isolation():
+def test_live_dry_run_uses_minimal_motion_with_hard_motor_topic_isolation():
     source = (ROOT / "launch" / "live_pipeline_dry_run.launch.py").read_text(
         encoding="utf-8"
     )
     assert 'executable="yolo_bev"' in source
     assert 'executable="cnn_path"' in source
     assert 'executable="cnn_drive_gate"' in source
-    assert 'executable="cnn_motion"' in source
+    assert 'executable="simple_motion"' in source
+    assert '"config", "simple_motion.yaml"' in source
+    assert 'DeclareLaunchArgument("speed_cap", default_value="5.0")' in source
     assert 'executable="live_pipeline_viewer"' in source
     assert '("/drive_cmd", "/debug/drive_cmd_dryrun")' in source
-    assert '("/teleop_cmd", "/debug/teleop_cmd_dryrun")' in source
     assert '("/xycar_motor", "/debug/xycar_motor_dryrun")' in source
     assert '"initial_manual_go": True' in source
     assert 'executable="car_state"' not in source

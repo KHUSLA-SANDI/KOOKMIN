@@ -232,15 +232,17 @@ if rclpy is not None:
             self._drive_pub.publish(command)
             status = (decision.drive_allowed, decision.reason)
             if status != self._last_status:
-                level = (
-                    self.get_logger().info
-                    if decision.drive_allowed
-                    else self.get_logger().warning
-                )
-                level(
-                    "drive gate %s reason=%s"
-                    % ("DRIVE" if decision.drive_allowed else "STOP", decision.reason)
-                )
+                # rclpy keys a log callsite by source location and rejects a
+                # later call from that same line with a different severity.
+                # Keep INFO and WARN on distinct callsites.
+                if decision.drive_allowed:
+                    self.get_logger().info(
+                        f"drive gate DRIVE reason={decision.reason}"
+                    )
+                else:
+                    self.get_logger().warning(
+                        f"drive gate STOP reason={decision.reason}"
+                    )
                 self._last_status = status
 
 
