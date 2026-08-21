@@ -36,6 +36,12 @@ from .path_contract import (
 TRAINING_CHECKPOINT_SCHEMA = "dual_route_path_cnn_checkpoint_v1_gpt"
 TRAINING_MANIFEST_SCHEMA = "cnn_dual_route_full_bev_v1_gpt"
 TRAINING_BEV_TOPOLOGY = "full_mask_occupancy_no_x_bin_median"
+SEPARATE_SINGLE_SCHEMA = "single_route_path_cnn_v1_gpt"
+SEPARATE_SINGLE_NAME = "separate_encoder_single_route"
+SEPARATE_DUAL_SCHEMA = "bev_path_model_candidate_v1_gpt"
+SEPARATE_DUAL_NAME = "separate_encoder_gated_dual_route"
+MODEL_KIND_SEPARATE_SINGLE = "separate_encoder_single"
+MODEL_KIND_SEPARATE_DUAL = "separate_encoder_dual_main_only"
 
 try:
     import torch
@@ -134,6 +140,187 @@ if nn is not None:
                 "shortcut_valid": shortcut[:, count:],
             }
 
+
+    class _ConvBlock(nn.Sequential):
+        def __init__(self, in_channels: int, out_channels: int):
+            super().__init__(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+
+
+    class _BranchEncoder(nn.Module):
+        def __init__(
+            self,
+            in_channels: int,
+            width: int,
+            feature_dim: int,
+            dropout: float,
+        ):
+            super().__init__()
+            self.spatial = nn.Sequential(
+                _ConvBlock(in_channels, width),
+                _ConvBlock(width, width * 2),
+                _ConvBlock(width * 2, width * 4),
+                _ConvBlock(width * 4, width * 4),
+                _ConvBlock(width * 4, width * 4),
+                nn.AdaptiveAvgPool2d((2, 3)),
+            )
+            self.project = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(width * 4 * 2 * 3, feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+            )
+
+        def forward(self, values):
+            return self.project(self.spatial(values))
+
+
+    class SeparateEncoderSinglePathNet(nn.Module):
+        """Exact runtime copy of ``SeparateEncoderSingleRouteCNN``."""
+
+        def __init__(
+            self,
+            n_points: int = OUT_N,
+            lane_width: int = 24,
+            lidar_width: int = 12,
+            lane_feature_dim: int = 192,
+            lidar_feature_dim: int = 96,
+            feature_dim: int = 256,
+            dropout: float = 0.15,
+        ):
+            super().__init__()
+            self.n_points = int(n_points)
+            self.lane_encoder = _BranchEncoder(
+                2, lane_width, lane_feature_dim, dropout
+            )
+            self.lidar_encoder = _BranchEncoder(
+                1, lidar_width, lidar_feature_dim, dropout
+            )
+            joint_dim = lane_feature_dim + lidar_feature_dim
+            self.lidar_gate_head = nn.Sequential(
+                nn.Linear(joint_dim, lidar_feature_dim),
+                nn.Sigmoid(),
+            )
+            self.fusion = nn.Sequential(
+                nn.Linear(joint_dim, feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+            )
+            self.path_head = nn.Linear(feature_dim, self.n_points * 2)
+
+        def forward(self, bev):
+            lane = self.lane_encoder(bev[:, :2])
+            lidar = self.lidar_encoder(bev[:, 2:3])
+            joint = torch.cat((lane, lidar), dim=1)
+            gate = self.lidar_gate_head(joint)
+            fused = self.fusion(torch.cat((lane, gate * lidar), dim=1))
+            values = self.path_head(fused)
+            return {
+                "path_y": values[:, : self.n_points],
+                "path_valid": values[:, self.n_points :],
+            }
+
+
+    class _ConsistentRouteDecoder(nn.Module):
+        def __init__(
+            self,
+            feature_dim: int,
+            n_points: int,
+            hard_gate_eval: bool,
+            fork_threshold: float,
+        ):
+            super().__init__()
+            self.n_points = int(n_points)
+            self.hard_gate_eval = bool(hard_gate_eval)
+            self.fork_threshold = float(fork_threshold)
+            self.main_head = nn.Linear(feature_dim, self.n_points * 2)
+            self.shortcut_delta_head = nn.Linear(feature_dim, self.n_points * 2)
+            self.fork_head = nn.Linear(feature_dim, 1)
+
+        def forward(self, features):
+            main = self.main_head(features)
+            delta = self.shortcut_delta_head(features)
+            fork_logit = self.fork_head(features).squeeze(1)
+            probability = fork_logit.sigmoid()
+            if self.hard_gate_eval and not self.training:
+                probability = (probability >= self.fork_threshold).to(features.dtype)
+            gate = probability[:, None]
+            main_y = main[:, : self.n_points]
+            main_valid = main[:, self.n_points :]
+            delta_y = delta[:, : self.n_points]
+            delta_valid = delta[:, self.n_points :]
+            return {
+                "main_y": main_y,
+                "main_valid": main_valid,
+                "shortcut_y": main_y + gate * delta_y,
+                "shortcut_valid": main_valid + gate * delta_valid,
+                "fork_logit": fork_logit,
+                "fork_probability": probability,
+                "shortcut_delta_y": delta_y,
+                "shortcut_delta_valid": delta_valid,
+            }
+
+
+    class SeparateEncoderDualMainPathNet(nn.Module):
+        """Exact CONE checkpoint architecture; runtime intentionally uses main."""
+
+        def __init__(
+            self,
+            n_points: int = OUT_N,
+            lane_width: int = 24,
+            lidar_width: int = 12,
+            lane_feature_dim: int = 192,
+            lidar_feature_dim: int = 96,
+            feature_dim: int = 256,
+            dropout: float = 0.15,
+            hard_gate_eval: bool = False,
+            fork_threshold: float = 0.5,
+        ):
+            super().__init__()
+            self.n_points = int(n_points)
+            self.lane_encoder = _BranchEncoder(
+                2, lane_width, lane_feature_dim, dropout
+            )
+            self.lidar_encoder = _BranchEncoder(
+                1, lidar_width, lidar_feature_dim, dropout
+            )
+            joint_dim = lane_feature_dim + lidar_feature_dim
+            self.lidar_gate_head = nn.Sequential(
+                nn.Linear(joint_dim, lidar_feature_dim),
+                nn.Sigmoid(),
+            )
+            self.fusion = nn.Sequential(
+                nn.Linear(joint_dim, feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+            )
+            self.decoder = _ConsistentRouteDecoder(
+                feature_dim,
+                self.n_points,
+                hard_gate_eval,
+                fork_threshold,
+            )
+
+        def forward(self, bev):
+            lane = self.lane_encoder(bev[:, :2])
+            lidar = self.lidar_encoder(bev[:, 2:3])
+            joint = torch.cat((lane, lidar), dim=1)
+            gate = self.lidar_gate_head(joint)
+            fused = self.fusion(torch.cat((lane, gate * lidar), dim=1))
+            output = self.decoder(fused)
+            output["lidar_gate"] = gate
+            return output
+
 else:
 
     class LegacySinglePathNet:
@@ -142,6 +329,16 @@ else:
 
 
     class CanonicalDualPathNet:
+        def __init__(self, *args, **kwargs):
+            _require_torch()
+
+
+    class SeparateEncoderSinglePathNet:
+        def __init__(self, *args, **kwargs):
+            _require_torch()
+
+
+    class SeparateEncoderDualMainPathNet:
         def __init__(self, *args, **kwargs):
             _require_torch()
 
@@ -324,7 +521,91 @@ def _metadata_from_payload(payload: Mapping[str, Any]) -> dict:
     return metadata
 
 
+def _specialized_checkpoint_metadata(
+    payload: Mapping[str, Any], model_kind: str
+) -> dict:
+    """Validate the two 2026-08-21 late-fusion checkpoint contracts."""
+
+    try:
+        config = dict(_require_mapping(payload.get("model_config"), "model_config"))
+        n_points = int(config.get("n_points"))
+    except (TypeError, ValueError) as exc:
+        raise PathModelError("specialized checkpoint model_config is invalid") from exc
+    if n_points != OUT_N:
+        raise PathModelError("specialized checkpoint n_points mismatch")
+
+    expected_out_x = np.asarray(OUT_X, dtype=np.float64)
+    if model_kind == MODEL_KIND_SEPARATE_SINGLE:
+        if payload.get("schema_version") != SEPARATE_SINGLE_SCHEMA:
+            raise PathModelError("single-route checkpoint schema mismatch")
+        if payload.get("model_name") != SEPARATE_SINGLE_NAME:
+            raise PathModelError("single-route checkpoint model_name mismatch")
+        input_contract = _require_mapping(
+            payload.get("input_contract"), "input_contract"
+        )
+        output_contract = _require_mapping(
+            payload.get("output_contract"), "output_contract"
+        )
+        try:
+            shape = tuple(int(value) for value in input_contract.get("shape_chw", ()))
+            route_count = int(output_contract.get("route_count"))
+            path_points = int(output_contract.get("path_y_points"))
+            valid_points = int(output_contract.get("path_valid_logits"))
+        except (TypeError, ValueError) as exc:
+            raise PathModelError("single-route checkpoint contract is invalid") from exc
+        if shape != INPUT_SHAPE:
+            raise PathModelError("single-route input shape mismatch")
+        channels = tuple(str(value) for value in input_contract.get("channels", ()))
+        if channels not in (
+            ("mid_yellow", "lane_white", "lidar_filtered"),
+            ("mid_yellow", "lane_white", "lidar"),
+        ):
+            raise PathModelError("single-route input channels mismatch")
+        if route_count != 1 or path_points != OUT_N or valid_points != OUT_N:
+            raise PathModelError("single-route output size mismatch")
+        out_x = np.asarray(output_contract.get("out_x_m", ()), dtype=np.float64)
+    elif model_kind == MODEL_KIND_SEPARATE_DUAL:
+        if payload.get("schema_version") != SEPARATE_DUAL_SCHEMA:
+            raise PathModelError("CONE checkpoint schema mismatch")
+        if payload.get("model_name") != SEPARATE_DUAL_NAME:
+            raise PathModelError("CONE checkpoint model_name mismatch")
+        try:
+            shape = tuple(int(value) for value in payload.get("input_shape", ()))
+            payload_points = int(payload.get("n_points"))
+        except (TypeError, ValueError) as exc:
+            raise PathModelError("CONE checkpoint contract is invalid") from exc
+        if shape != INPUT_SHAPE or payload_points != OUT_N:
+            raise PathModelError("CONE checkpoint input/output size mismatch")
+        output_keys = {str(value) for value in payload.get("output_keys", ())}
+        if not {"main_y", "main_valid"}.issubset(output_keys):
+            raise PathModelError("CONE checkpoint has no main route output")
+        out_x = expected_out_x
+    else:
+        raise PathModelError(f"unsupported specialized model kind: {model_kind}")
+
+    if out_x.shape != expected_out_x.shape or not np.allclose(
+        out_x, expected_out_x, rtol=0.0, atol=1e-6
+    ):
+        raise PathModelError("specialized checkpoint OUT_X mismatch")
+
+    return {
+        "schema_version": str(payload.get("schema_version")),
+        "model_kind": model_kind,
+        "input_shape": list(INPUT_SHAPE),
+        "input_channels": ["mid_yellow", "lane_white", "lidar_filtered"],
+        "out_x": [float(value) for value in OUT_X],
+        "model_config": config,
+        "runtime_route": "main",
+    }
+
+
 def _detect_model_kind(payload: Mapping[str, Any], state_dict: Mapping[str, Any]) -> str:
+    schema = payload.get("schema_version")
+    model_name = payload.get("model_name")
+    if schema == SEPARATE_SINGLE_SCHEMA and model_name == SEPARATE_SINGLE_NAME:
+        return MODEL_KIND_SEPARATE_SINGLE
+    if schema == SEPARATE_DUAL_SCHEMA and model_name == SEPARATE_DUAL_NAME:
+        return MODEL_KIND_SEPARATE_DUAL
     metadata = _metadata_from_payload(payload)
     explicit = metadata.get("model_kind", payload.get("model_kind"))
     if explicit is not None:
@@ -378,6 +659,34 @@ class LoadedPathModel:
         tensor = torch.from_numpy(values[None]).to(self.device)
         with torch.inference_mode():
             output = self.model(tensor)
+
+        if self.model_kind == MODEL_KIND_SEPARATE_SINGLE:
+            if not isinstance(output, Mapping) or not {
+                "path_y",
+                "path_valid",
+            }.issubset(output):
+                raise PathModelError("single-route model output contract mismatch")
+            return sanitize_dual_prediction(
+                _first_numpy(output["path_y"]),
+                _first_numpy(output["path_valid"]),
+                config=self.guard,
+            )
+
+        if self.model_kind == MODEL_KIND_SEPARATE_DUAL:
+            if not isinstance(output, Mapping) or not {
+                "main_y",
+                "main_valid",
+            }.issubset(output):
+                raise PathModelError("CONE model output contract mismatch")
+            # The current CONE checkpoint was trained with two near-identical
+            # route heads.  CONE mode intentionally consumes main only.  A
+            # future single-route CONE checkpoint can replace it without
+            # changing the node API.
+            return sanitize_dual_prediction(
+                _first_numpy(output["main_y"]),
+                _first_numpy(output["main_valid"]),
+                config=self.guard,
+            )
 
         if self.model_kind == MODEL_KIND_LEGACY:
             if not isinstance(output, (tuple, list)) or len(output) != 2:
@@ -474,14 +783,21 @@ def load_path_model(
 
     state_dict = _strip_state_prefixes(_state_dict_from_payload(payload))
     model_kind = _detect_model_kind(payload, state_dict)
-    metadata = _metadata_from_payload(payload)
-    try:
-        metadata = validate_checkpoint_metadata(metadata, model_kind)
-    except PathContractError as exc:
-        raise PathModelError(str(exc)) from exc
+    if model_kind in (MODEL_KIND_SEPARATE_SINGLE, MODEL_KIND_SEPARATE_DUAL):
+        metadata = _specialized_checkpoint_metadata(payload, model_kind)
+    else:
+        metadata = _metadata_from_payload(payload)
+        try:
+            metadata = validate_checkpoint_metadata(metadata, model_kind)
+        except PathContractError as exc:
+            raise PathModelError(str(exc)) from exc
 
     width = _checkpoint_width(payload)
-    if model_kind == MODEL_KIND_LEGACY:
+    if model_kind == MODEL_KIND_SEPARATE_SINGLE:
+        model = SeparateEncoderSinglePathNet(**metadata["model_config"])
+    elif model_kind == MODEL_KIND_SEPARATE_DUAL:
+        model = SeparateEncoderDualMainPathNet(**metadata["model_config"])
+    elif model_kind == MODEL_KIND_LEGACY:
         model = LegacySinglePathNet(width=width)
     else:
         model = CanonicalDualPathNet(width=width)

@@ -19,7 +19,7 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from ultralytics import YOLO
 
 from .bev_geometry import (
@@ -39,8 +39,12 @@ from .bev_geometry import (
 )
 from .signal_mission import (
     encode_signal_payload,
+    extract_class_detection,
     extract_signal_confidences,
+    extract_signal_detections,
+    optional_class_id,
     signal_class_ids,
+    TimedTriggerLatch,
 )
 
 
@@ -235,7 +239,7 @@ def make_signal_preview(
 
 
 class YoloBevNode(Node):
-    """Run exactly one ``best_0817`` segmentation model on the newest frame."""
+    """Run exactly one seven-class v3 segmentation model on the newest frame."""
 
     def __init__(self) -> None:
         super().__init__("yolo_bev_node")
@@ -244,7 +248,7 @@ class YoloBevNode(Node):
         self.declare_parameter("bev_topic", "/perception/bev")
         self.declare_parameter("signal_topic", "/perception/signals")
         self.declare_parameter("diag_topic", "/diagnostics/yolo_bev_timing")
-        self.declare_parameter("model_path", "/home/xytron/xycar_ws/models/best_0817.pt")
+        self.declare_parameter("model_path", "/home/xytron/xycar_ws/models/best_v3_gpt.pt")
         self.declare_parameter(
             "expected_model_sha256", DEFAULT_EXPECTED_MODEL_SHA256
         )
@@ -252,6 +256,13 @@ class YoloBevNode(Node):
         self.declare_parameter("imgsz", [384, 640])
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("signal_conf", 0.25)
+        self.declare_parameter("cone_mode_topic", "/cone_mode")
+        # Roboflow v3 names the cone-section trigger class START_R.
+        self.declare_parameter("cone_trigger_class_name", "START_R")
+        self.declare_parameter("cone_trigger_conf", 0.25)
+        self.declare_parameter("cone_enter_bottom_y_min", 0.55)
+        self.declare_parameter("cone_enter_confirm_frames", 2)
+        self.declare_parameter("cone_exit_hold_sec", 1.0)
         self.declare_parameter("iou", 0.70)
         self.declare_parameter("device", "cpu")
         self.declare_parameter("cv_threads", 4)
@@ -269,6 +280,7 @@ class YoloBevNode(Node):
         self._image_topic = str(self.get_parameter("image_topic").value)
         self._bev_topic = str(self.get_parameter("bev_topic").value)
         self._signal_topic = str(self.get_parameter("signal_topic").value)
+        self._cone_mode_topic = str(self.get_parameter("cone_mode_topic").value)
         self._diag_topic = str(self.get_parameter("diag_topic").value)
         self._model_path = Path(str(self.get_parameter("model_path").value)).expanduser()
         self._expected_model_sha256 = str(
@@ -278,6 +290,15 @@ class YoloBevNode(Node):
         self._imgsz = normalize_imgsz(self.get_parameter("imgsz").value)
         self._conf = float(self.get_parameter("conf").value)
         self._signal_conf = float(self.get_parameter("signal_conf").value)
+        self._cone_trigger_class_name = str(
+            self.get_parameter("cone_trigger_class_name").value
+        ).strip()
+        self._cone_trigger_conf = float(
+            self.get_parameter("cone_trigger_conf").value
+        )
+        self._cone_enter_bottom_y_min = float(
+            self.get_parameter("cone_enter_bottom_y_min").value
+        )
         if not 0.0 <= self._signal_conf <= 1.0:
             raise ValueError("signal_conf must be within [0, 1]")
         if self._signal_conf < self._conf:
@@ -285,6 +306,16 @@ class YoloBevNode(Node):
                 "signal_conf cannot be lower than conf because Ultralytics "
                 "already removes boxes below conf in the shared inference result"
             )
+        if not self._conf <= self._cone_trigger_conf <= 1.0:
+            raise ValueError("cone_trigger_conf must be within [conf, 1]")
+        if not 0.0 <= self._cone_enter_bottom_y_min <= 1.0:
+            raise ValueError("cone_enter_bottom_y_min must be within [0, 1]")
+        self._cone_mode_latch = TimedTriggerLatch(
+            enter_confirm_frames=int(
+                self.get_parameter("cone_enter_confirm_frames").value
+            ),
+            exit_hold_sec=float(self.get_parameter("cone_exit_hold_sec").value),
+        )
         self._iou = float(self.get_parameter("iou").value)
         self._device = str(self.get_parameter("device").value)
         self._supersample = int(self.get_parameter("supersample").value)
@@ -328,8 +359,16 @@ class YoloBevNode(Node):
         self._lane_id, self._mid_id = class_ids(names)
         # Signals are extracted from this same Results object; no second model
         # or inference pass is permitted.  Fail closed if a lane-only checkpoint
-        # is accidentally deployed instead of the six-class best_0817 model.
+        # is accidentally deployed instead of the seven-class v3 model.
         self._signal_ids = signal_class_ids(names)
+        self._cone_trigger_id = optional_class_id(
+            names, self._cone_trigger_class_name
+        )
+        if self._cone_trigger_id is None:
+            self.get_logger().warning(
+                "cone trigger class is not in this model; /cone_mode remains false: "
+                f"name={self._cone_trigger_class_name!r}"
+            )
 
         self._latest = _LatestOnlyBuffer()
         self._stopping = threading.Event()
@@ -350,6 +389,9 @@ class YoloBevNode(Node):
         self._bev_publisher = self.create_publisher(Image, self._bev_topic, sensor_qos)
         self._signal_publisher = self.create_publisher(
             String, self._signal_topic, 1
+        )
+        self._cone_mode_publisher = self.create_publisher(
+            Bool, self._cone_mode_topic, 1
         )
         self._diag_publisher = (
             self.create_publisher(String, self._diag_topic, 10)
@@ -384,6 +426,9 @@ class YoloBevNode(Node):
                 "signal_ids": self._signal_ids,
                 "signal_topic": self._signal_topic,
                 "signal_conf": self._signal_conf,
+                "cone_trigger_class_name": self._cone_trigger_class_name,
+                "cone_trigger_id": self._cone_trigger_id,
+                "cone_mode_topic": self._cone_mode_topic,
                 "signal_preview_topic": (
                     self._signal_preview_topic
                     if self._signal_preview_publisher is not None
@@ -493,9 +538,40 @@ class YoloBevNode(Node):
             self._signal_ids,
             min_confidence=self._signal_conf,
         )
+        signal_detections = extract_signal_detections(
+            result,
+            self._signal_ids,
+            image_hw=(int(bgr.shape[0]), int(bgr.shape[1])),
+            min_confidence=self._signal_conf,
+        )
         signal_message = String()
-        signal_message.data = encode_signal_payload(sequence, signals)
+        signal_message.data = encode_signal_payload(
+            sequence,
+            signals,
+            signal_detections,
+        )
         self._signal_publisher.publish(signal_message)
+
+        cone_detection = extract_class_detection(
+            result,
+            self._cone_trigger_id,
+            image_hw=(int(bgr.shape[0]), int(bgr.shape[1])),
+            min_confidence=self._cone_trigger_conf,
+        )
+        cone_enter_ready = bool(
+            cone_detection is not None
+            and cone_detection["y2_norm"] >= self._cone_enter_bottom_y_min
+        )
+        cone_update = self._cone_mode_latch.observe(
+            cone_enter_ready,
+            now_sec=time.monotonic(),
+        )
+        self._cone_mode_publisher.publish(Bool(data=cone_update.active))
+        if cone_update.changed:
+            self.get_logger().info(
+                "motion mode trigger changed: %s"
+                % ("CONE" if cone_update.active else "NORMAL")
+            )
 
         post_started_ns = time.monotonic_ns()
         lane_native, mid_native = native_lane_mid_unions(
@@ -560,6 +636,9 @@ class YoloBevNode(Node):
                 "mid_cells": int(np.count_nonzero(mid_grid)),
                 "lane_cells": int(np.count_nonzero(lane_grid)),
                 "signals": signals,
+                "cone_mode": cone_update.active,
+                "cone_trigger_ready": cone_enter_ready,
+                "cone_trigger": cone_detection,
             },
             inference_ms,
             total_ms,

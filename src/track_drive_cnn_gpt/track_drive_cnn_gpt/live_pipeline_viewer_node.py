@@ -2,8 +2,8 @@
 """Read-only live dashboard for the real perception, CNN, and motion pipeline.
 
 The node never publishes a control command.  It shows the latest camera frame,
-camera BEV, raw LiDAR raster, both CNN candidates, the selected center path,
-YOLO signal confidences, and the remapped dry-run motion output.
+the exact mode-specific CNN input BEV, path output, trigger diagnostics, YOLO
+signal confidences, and the remapped dry-run motion output.
 """
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
-from sensor_msgs.msg import CompressedImage, Image, LaserScan
-from std_msgs.msg import Float32MultiArray, String
+from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import Bool, Float32MultiArray, String
 
-from .lidar_geometry import GRID_H, GRID_W, scan_to_grid
+from .lidar_geometry import GRID_H, GRID_W
 from .path_contract import (
     GRID_RESOLUTION_M,
     GRID_X_BOUNDS_M,
@@ -52,8 +52,20 @@ class LivePipelineViewerNode(Node):
         p = self._parameter
         self._image_topic = str(p("image_topic", "/image_raw"))
         self._bev_topic = str(p("bev_topic", "/perception/bev"))
-        self._scan_topic = str(p("scan_topic", "/scan"))
+        self._cnn_input_bev_topic = str(
+            p("cnn_input_bev_topic", "/debug/cnn_input_bev")
+        )
         self._signal_topic = str(p("signal_topic", "/perception/signals"))
+        self._cone_trigger_topic = str(
+            p("cone_trigger_topic", "/perception/cone_trigger")
+        )
+        self._cone_mode_topic = str(p("cone_mode_topic", "/cone_mode"))
+        self._cnn_mode_topic = str(p("cnn_mode_topic", "/cnn_mode"))
+        self._traffic_stop_topic = str(p("traffic_stop_topic", "/traffic_stop"))
+        self._decision_center_y_max = float(
+            p("signal_decision_center_y_max", 0.22)
+        )
+        self._decision_min_width = float(p("signal_decision_min_width", 0.08))
         self._motion_topic = str(
             p("motion_topic", "/debug/xycar_motor_dryrun")
         )
@@ -73,13 +85,6 @@ class LivePipelineViewerNode(Node):
             str(p("screenshot_dir", "/home/xytron/pipeline_view_shots_gpt"))
         ).expanduser()
 
-        self._range_scale = float(p("lidar_range_scale", 1.1476))
-        self._range_min = float(p("lidar_min_range", 0.05))
-        self._range_max = float(p("lidar_max_range", 8.0))
-        self._self_x = float(p("lidar_self_x_abs", 0.25))
-        self._self_y = float(p("lidar_self_y_abs", 0.15))
-        self._lidar_radius = int(p("lidar_radius_cells", 1))
-
         if self._render_hz <= 0.0 or self._camera_width <= 0:
             raise ValueError("render_hz and camera_panel_width must be positive")
         if self._canvas_height < 540 or self._bev_scale < 1:
@@ -88,6 +93,10 @@ class LivePipelineViewerNode(Node):
             raise ValueError("jpeg_quality must be in [1,100]")
         if self._speed_visual_max <= 0.0:
             raise ValueError("speed_visual_max must be positive")
+        if not 0.0 <= self._decision_center_y_max <= 1.0:
+            raise ValueError("signal_decision_center_y_max must be within [0,1]")
+        if not 0.0 <= self._decision_min_width <= 1.0:
+            raise ValueError("signal_decision_min_width must be within [0,1]")
 
         if self._show_window and not os.environ.get("DISPLAY"):
             self.get_logger().warning(
@@ -107,8 +116,23 @@ class LivePipelineViewerNode(Node):
         self._shortcut = np.empty((0, 2), dtype=np.float32)
         self._selected = np.empty((0, 2), dtype=np.float32)
         self._signals: dict[str, float] = {}
+        self._signal_detections: dict[str, dict[str, float]] = {}
         self._signal_sequence = -1
         self._route_intent = "main"
+        self._cone_mode = False
+        self._cone_trigger_raw = False
+        self._cnn_mode = "GENERAL"
+        self._mode_remaining_sec = 0.0
+        self._lidar_preprocess = "waiting"
+        self._raw_lidar_points = 0
+        self._used_lidar_points = 0
+        self._road_trigger = False
+        self._road_trigger_points = 0
+        self._overtake_confirm_count = 0
+        self._overtake_confirm_frames = 2
+        self._left_streak = 0
+        self._traffic_stop = False
+        self._traffic_stop_seen = False
         self._cnn_status = "waiting for CNN"
         self._motion_angle = 0.0
         self._motion_speed = 0.0
@@ -125,7 +149,10 @@ class LivePipelineViewerNode(Node):
             Image, self._bev_topic, self._on_bev, LATEST_SENSOR_QOS
         )
         self.create_subscription(
-            LaserScan, self._scan_topic, self._on_scan, LATEST_SENSOR_QOS
+            Image,
+            self._cnn_input_bev_topic,
+            self._on_cnn_input_bev,
+            LATEST_SENSOR_QOS,
         )
         self.create_subscription(PoseArray, "/cnn/path_main", self._on_main, 10)
         self.create_subscription(
@@ -135,6 +162,12 @@ class LivePipelineViewerNode(Node):
         self.create_subscription(String, "/route_intent", self._on_route, 10)
         self.create_subscription(String, "/debug/cnn_path", self._on_cnn_diag, 10)
         self.create_subscription(String, self._signal_topic, self._on_signals, 10)
+        self.create_subscription(Bool, self._cone_mode_topic, self._on_cone_mode, 10)
+        self.create_subscription(
+            Bool, self._cone_trigger_topic, self._on_cone_trigger, 10
+        )
+        self.create_subscription(String, self._cnn_mode_topic, self._on_cnn_mode, 10)
+        self.create_subscription(Bool, self._traffic_stop_topic, self._on_traffic_stop, 10)
         self.create_subscription(
             Float32MultiArray, self._motion_topic, self._on_motion, 10
         )
@@ -175,26 +208,25 @@ class LivePipelineViewerNode(Node):
                 self._selected = np.empty((0, 2), np.float32)
             self._bev_stamp = stamp
 
-    def _on_scan(self, message: LaserScan) -> None:
+    def _on_cnn_input_bev(self, message: Image) -> None:
         try:
-            grid, _points = scan_to_grid(
-                message.ranges,
-                message.angle_min,
-                message.angle_increment,
-                radius_cells=self._lidar_radius,
-                range_scale=self._range_scale,
-                min_range_m=self._range_min,
-                max_range_m=self._range_max,
-                self_x_abs_m=self._self_x,
-                self_y_abs_m=self._self_y,
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
+            bev = _decode_bev(message)
+            if bev.shape != (GRID_H, GRID_W, 3):
+                raise ValueError(f"CNN input BEV shape is invalid: {bev.shape}")
+        except ValueError as exc:
             self.get_logger().warning(
-                f"viewer dropped LaserScan: {exc}", throttle_duration_sec=1.0
+                f"viewer dropped CNN input BEV: {exc}", throttle_duration_sec=1.0
             )
             return
+        stamp = _stamp_ns(message.header)
         with self._lock:
-            self._lidar = grid
+            if stamp != self._bev_stamp:
+                self._main = np.empty((0, 2), np.float32)
+                self._shortcut = np.empty((0, 2), np.float32)
+                self._selected = np.empty((0, 2), np.float32)
+            self._bev = bev
+            self._lidar = bev[:, :, 2].copy()
+            self._bev_stamp = stamp
 
     @staticmethod
     def _poses(message: PoseArray) -> np.ndarray:
@@ -233,20 +265,57 @@ class LivePipelineViewerNode(Node):
                 for name, confidence in signals.items()
                 if math.isfinite(float(confidence))
             }
+            raw_detections = payload.get("detections", {})
+            if not isinstance(raw_detections, dict):
+                raise ValueError("detections is not an object")
+            parsed_detections: dict[str, dict[str, float]] = {}
+            for name, item in raw_detections.items():
+                if not isinstance(item, dict):
+                    continue
+                center_y = float(item["center_y_norm"])
+                width = float(item["width_norm"])
+                if math.isfinite(center_y) and math.isfinite(width):
+                    parsed_detections[str(name).upper()] = {
+                        "center_y_norm": center_y,
+                        "width_norm": width,
+                    }
             sequence = int(payload.get("sequence", -1))
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(
                 f"viewer signal parse failed: {exc}", throttle_duration_sec=1.0
             )
             return
         with self._lock:
             self._signals = parsed
+            self._signal_detections = parsed_detections
             self._signal_sequence = sequence
 
+    def _on_cone_mode(self, message: Bool) -> None:
+        with self._lock:
+            self._cone_mode = bool(message.data)
+
+    def _on_cone_trigger(self, message: Bool) -> None:
+        with self._lock:
+            self._cone_trigger_raw = bool(message.data)
+
+    def _on_cnn_mode(self, message: String) -> None:
+        with self._lock:
+            self._cnn_mode = str(message.data).strip().upper() or "UNKNOWN"
+
+    def _on_traffic_stop(self, message: Bool) -> None:
+        with self._lock:
+            self._traffic_stop = bool(message.data)
+            self._traffic_stop_seen = True
+
     def _on_cnn_diag(self, message: String) -> None:
+        payload: dict = {}
+        road: dict = {}
         try:
             payload = json.loads(message.data)
             route = payload.get("route_intent")
+            road = payload.get("road_lidar", {})
+            if not isinstance(road, dict):
+                road = {}
             if payload.get("ok"):
                 status = (
                     f"CNN {payload.get('cnn_total_ms', '?')}ms "
@@ -261,6 +330,29 @@ class LivePipelineViewerNode(Node):
             route = None
         with self._lock:
             self._cnn_status = status
+            mode = payload.get("cnn_mode") if isinstance(payload, dict) else None
+            if isinstance(mode, str) and mode.strip():
+                self._cnn_mode = mode.strip().upper()
+            self._mode_remaining_sec = float(payload.get("mode_remaining_sec", 0.0))
+            self._lidar_preprocess = str(
+                payload.get("lidar_preprocess_mode", self._lidar_preprocess)
+            )
+            self._raw_lidar_points = int(payload.get("raw_lidar_points", 0))
+            self._used_lidar_points = int(
+                payload.get(
+                    "used_lidar_points",
+                    payload.get("filtered_lidar_points", 0),
+                )
+            )
+            self._road_trigger = bool(road.get("trigger_detected", False))
+            self._road_trigger_points = int(road.get("trigger_inside_points", 0))
+            self._overtake_confirm_count = int(
+                payload.get("overtake_confirm_count", 0)
+            )
+            self._overtake_confirm_frames = int(
+                payload.get("overtake_confirm_frames", 2)
+            )
+            self._left_streak = int(payload.get("left_streak", 0))
             if isinstance(route, str) and route.strip():
                 self._route_intent = route.strip().casefold()
 
@@ -276,8 +368,21 @@ class LivePipelineViewerNode(Node):
             self._motion_seen = True
 
     def _on_arbitration(self, message: String) -> None:
+        text = str(message.data).strip() or "motion debug empty"
+        try:
+            payload = json.loads(text)
+            text = (
+                f"MOTION profile={payload.get('profile', '?')} "
+                f"lookahead={float(payload.get('lookahead_m', 0.0)):.2f}m "
+                f"gain={float(payload.get('steer_gain', 0.0)):.2f} "
+                f"alpha={float(payload.get('steer_smooth_alpha', 0.0)):.2f} "
+                f"speed={float(payload.get('requested_speed', 0.0)):.1f} "
+                f"drive={payload.get('drive', False)} reason={payload.get('reason', '?')}"
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
         with self._lock:
-            self._arbitration = str(message.data).strip() or "motion debug empty"
+            self._arbitration = text
 
     @staticmethod
     def _path_pixels(points: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -395,8 +500,25 @@ class LivePipelineViewerNode(Node):
             shortcut = self._shortcut.copy()
             selected = self._selected.copy()
             signals = dict(self._signals)
+            signal_detections = {
+                name: dict(item) for name, item in self._signal_detections.items()
+            }
             signal_sequence = self._signal_sequence
             route = self._route_intent
+            cone_mode = self._cone_mode
+            cone_trigger_raw = self._cone_trigger_raw
+            cnn_mode = self._cnn_mode
+            mode_remaining_sec = self._mode_remaining_sec
+            lidar_preprocess = self._lidar_preprocess
+            raw_lidar_points = self._raw_lidar_points
+            used_lidar_points = self._used_lidar_points
+            road_trigger = self._road_trigger
+            road_trigger_points = self._road_trigger_points
+            overtake_confirm_count = self._overtake_confirm_count
+            overtake_confirm_frames = self._overtake_confirm_frames
+            left_streak = self._left_streak
+            traffic_stop = self._traffic_stop
+            traffic_stop_seen = self._traffic_stop_seen
             cnn_status = self._cnn_status
             angle = self._motion_angle
             speed = self._motion_speed
@@ -420,35 +542,71 @@ class LivePipelineViewerNode(Node):
             22,
             dtype=np.uint8,
         )
-        canvas[74 : 74 + camera_panel.shape[0], : self._camera_width] = camera_panel
-        bev_top = max(74, (self._canvas_height - bev_panel.shape[0]) // 2)
+        canvas[96 : 96 + camera_panel.shape[0], : self._camera_width] = camera_panel
+        bev_top = max(96, (self._canvas_height - bev_panel.shape[0]) // 2)
         bev_left = self._camera_width + (right_width - bev_panel.shape[1]) // 2
         canvas[
             bev_top : bev_top + bev_panel.shape[0],
             bev_left : bev_left + bev_panel.shape[1],
         ] = bev_panel
 
-        signal_text = " | ".join(
-            f"{name}={confidence:.2f}"
-            for name, confidence in sorted(signals.items())
-        ) or "NONE"
-        cv2.putText(
-            canvas,
-            f"YOLO signals[{signal_sequence}]: {signal_text}"[:120],
-            (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68,
-            (0, 230, 255), 2, cv2.LINE_AA,
+        dominant = max(
+            ((float(confidence), str(name)) for name, confidence in signals.items()),
+            default=None,
+        )
+        dominant_name = dominant[1] if dominant is not None else "NONE"
+        dominant_conf = dominant[0] if dominant is not None else 0.0
+        detection = signal_detections.get(dominant_name, {})
+        center_y = detection.get("center_y_norm")
+        box_width = detection.get("width_norm")
+        decision_zone = bool(
+            center_y is not None
+            and box_width is not None
+            and center_y <= self._decision_center_y_max
+            and box_width >= self._decision_min_width
+        )
+        if traffic_stop_seen:
+            traffic_command = "STOP" if traffic_stop else "GO"
+            traffic_color = (30, 30, 245) if traffic_stop else (30, 225, 30)
+        else:
+            traffic_command = "WAIT"
+            traffic_color = (0, 210, 255)
+        geometry_text = (
+            f"cy={center_y:.3f}<={self._decision_center_y_max:.2f} "
+            f"w={box_width:.3f}>={self._decision_min_width:.2f}"
+            if center_y is not None and box_width is not None
+            else "box=NONE"
         )
         cv2.putText(
             canvas,
-            f"route={route} selected={len(selected)}pts | {cnn_status}"[:130],
-            (14, 61), cv2.FONT_HERSHEY_SIMPLEX, 0.60,
+            (
+                f"TRAFFIC={traffic_command} | RED/YELLOW=STOP, GREEN/LEFT=GO | "
+                f"YOLO={dominant_name} {dominant_conf:.2f} "
+                f"zone={'IN' if decision_zone else 'OUT'} | {geometry_text}"
+            )[:150],
+            (14, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+            traffic_color, 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            (
+                f"MODE={cnn_mode} remain={mode_remaining_sec:.1f}s "
+                f"input={lidar_preprocess} lidar={raw_lidar_points}->{used_lidar_points} "
+                f"route={route.upper()} selected={len(selected)}pts | {cnn_status}"
+            )[:165],
+            (14, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
             (255, 255, 0), 2, cv2.LINE_AA,
         )
         cv2.putText(
             canvas,
-            "BEV yellow=mid white=lane red=raw lidar green=main magenta=shortcut cyan=selected",
-            (self._camera_width + 8, 30), cv2.FONT_HERSHEY_SIMPLEX,
-            0.38, (225, 225, 225), 1, cv2.LINE_AA,
+            (
+                f"TRIGGER LEFT={left_streak}/2 START_R={int(cone_trigger_raw)} "
+                f"IN_ROAD={int(road_trigger)} pts={road_trigger_points} "
+                f"OVERTAKE={overtake_confirm_count}/{overtake_confirm_frames} "
+                f"CONE_MODE={int(cone_mode)} | BEV red=actual CNN LiDAR input"
+            )[:180],
+            (14, 77), cv2.FONT_HERSHEY_SIMPLEX,
+            0.48, (225, 225, 225), 1, cv2.LINE_AA,
         )
         cv2.putText(
             canvas,

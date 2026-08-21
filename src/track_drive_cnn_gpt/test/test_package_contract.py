@@ -54,13 +54,27 @@ def test_runtime_grid_config_is_the_frozen_contract():
     assert params["max_bev_age_sec"] == 0.35
     assert params["shortcut_threshold"] == 0.50
     assert params["min_camera_cells"] == 1
-    assert params["expected_model_sha256"] == (
-        "439937eb506fe0a25c8d9f225abc2f10b4de96d388099fe4b2570598a5c03a67"
+    assert params["general_expected_sha256"] == (
+        "e90b0de551fdcdde5a5de96d754365380f49db412242535313c396a77201c1b1"
     )
-    assert params["lidar_preprocess_mode"] == "compact_reference"
-    assert params["min_lidar_cells"] == 27
-    assert params["max_lidar_cells"] == 67
-    assert params["lidar_max_clusters"] == 1
+    assert params["shortcut_model_path"].endswith("left_shortcut_single_best_gpt.pt")
+    assert params["shortcut_expected_sha256"] == (
+        "df965fecd187aeafe1fefc82916fda403c60459d3da0da42c7d47cd3eb85adb1"
+    )
+    assert params["overtake_model_path"].endswith("obstacle_single_best_gpt.pt")
+    assert params["overtake_expected_sha256"] == (
+        "23ff59b918a5af0dbbd31dfb8dcd41713b5c8554f5e38cdf8f07ed1bb37fb463"
+    )
+    assert params["cone_model_path"].endswith("cone_single_all967_final_gpt.pt")
+    assert params["cone_expected_sha256"] == (
+        "9250e5224a628672e40148c9a6f472a9c6cee2962b65175f0a6f92eb304c8913"
+    )
+    assert params["shortcut_hold_sec"] == 10.0
+    assert params["overtake_hold_sec"] == 7.0
+    assert params["cone_hold_sec"] == 20.0
+    assert params["overtake_inward_margin_m"] == 0.10
+    assert params["overtake_x_min_m"] == 0.0
+    assert params["overtake_x_max_m"] == 1.20
     assert params["max_abs_y_m"] >= 1.5
     assert params["max_abs_slope"] == 3.1
     assert params["max_abs_curvature"] == 12.0
@@ -110,22 +124,33 @@ def test_low_speed_launch_uses_minimal_motion_with_audited_car_yaml():
     assert 'executable="simple_motion"' in text
     assert '"config", "simple_motion.yaml"' in text
     assert "legacy_car_config" in text
-    assert 'DeclareLaunchArgument("speed_cap", default_value="5.0")' in text
+    assert 'DeclareLaunchArgument("speed_cap", default_value="10.0")' in text
     assert 'executable="cnn_drive_gate"' in text
     assert 'executable="cnn_supervisor"' not in text
     assert 'executable="mission_route"' not in text
     assert 'executable="motion"' not in text
 
 
-def test_simple_motion_has_only_three_control_tuning_values():
+def test_simple_motion_has_four_independent_profiles():
     config = yaml.safe_load(
         (ROOT / "config" / "simple_motion.yaml").read_text(encoding="utf-8")
     )["motion_node"]["ros__parameters"]
     assert config["lookahead_m"] == 1.0
-    assert config["steer_gain"] == 0.45
+    assert config["steer_gain"] == 1.0
     assert config["steer_smooth_alpha"] == 0.40
+    assert config["speed_cmd"] == 5.0
+    for prefix in ("shortcut", "overtake", "cone"):
+        assert f"{prefix}_lookahead_m" in config
+        assert f"{prefix}_steer_gain" in config
+        assert f"{prefix}_steer_smooth_alpha" in config
+        assert f"{prefix}_speed_cmd" in config
+    assert config["cone_lookahead_m"] == 0.8
+    assert config["cone_steer_gain"] == 0.55
+    assert config["cone_steer_smooth_alpha"] == 0.35
+    assert config["cone_speed_cmd"] == 3.5
+    assert config["cnn_mode_topic"] == "/cnn_mode"
     assert config["control_hz"] == 20.0
-    assert config["path_stale_sec"] == 0.25
+    assert config["path_stale_sec"] == 1.0
     assert config["verify_car_interface_source"] is True
     assert config["expected_car_interface_sha256"] == AUDITED_CAR_INTERFACE_SHA256
 
@@ -175,7 +200,7 @@ def test_drive_gate_requires_source_frame_and_timestamp_policy():
         (ROOT / "config" / "perception_cnn.yaml").read_text(encoding="utf-8")
     )["cnn_drive_gate_node"]["ros__parameters"]
     assert config["path_frame_id"] == "lidar_frame"
-    assert config["path_stale_sec"] == 0.25
+    assert config["path_stale_sec"] == 1.0
     assert config["path_future_tolerance_sec"] == 0.05
     assert config["enable_drive"] is False
     assert config["initial_manual_go"] is False
@@ -194,13 +219,35 @@ def test_rectangular_openvino_and_direct_signal_selection_are_configured():
     cnn = config["cnn_path_node"]["ros__parameters"]
     gate = config["cnn_drive_gate_node"]["ros__parameters"]
     assert yolo["imgsz"] == [384, 640]
+    assert yolo["model_path"] == (
+        "/home/xytron/xycar_ws/models/best_v3_gpt_openvino_model"
+    )
+    assert yolo["expected_model_sha256"] == (
+        "8ab529d985af95489c46fbd8293a3c1677150bc518e5c9f59f4fe51d0e514c89"
+    )
     assert yolo["signal_topic"] == "/perception/signals"
+    assert yolo["cone_mode_topic"] == "/perception/cone_trigger"
+    assert yolo["cone_trigger_class_name"] == "START_R"
     assert cnn["signal_topic"] == yolo["signal_topic"]
+    assert cnn["cone_trigger_topic"] == yolo["cone_mode_topic"]
+    assert cnn["cnn_mode_topic"] == "/cnn_mode"
+    assert cnn["cnn_input_bev_topic"] == "/debug/cnn_input_bev"
     assert cnn["center_path_topic"] == "/center_path"
     assert cnn["left_confirm_frames"] >= 2
     assert cnn["enable_center_path"] is True
     assert gate["center_path_topic"] == cnn["center_path_topic"]
     assert gate["enable_drive"] is False
+
+    viewer = config["live_pipeline_viewer_node"]["ros__parameters"]
+    assert viewer["cnn_input_bev_topic"] == cnn["cnn_input_bev_topic"]
+    assert viewer["cone_trigger_topic"] == cnn["cone_trigger_topic"]
+
+    cnn_source = (ROOT / "track_drive_cnn_gpt" / "cnn_path_node.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'if mode_state.mode == MODE_CONE:' in cnn_source
+    assert 'lidar = raw_lidar_grid' in cnn_source
+    assert 'lidar_preprocess = "outside_white_removed"' in cnn_source
 
     setup_text = (ROOT / "setup.py").read_text(encoding="utf-8")
     assert "cnn_drive_gate = track_drive_cnn_gpt.drive_gate_node:main" in setup_text
@@ -272,5 +319,33 @@ def test_live_dry_run_uses_minimal_motion_with_hard_motor_topic_isolation():
         ROOT / "track_drive_cnn_gpt" / "live_pipeline_viewer_node.py"
     ).read_text(encoding="utf-8")
     assert '"/debug/xycar_motor_dryrun"' in viewer
+    assert 'p("cone_mode_topic", "/cone_mode")' in viewer
+    assert "self._on_cone_mode" in viewer
+    assert 'p("traffic_stop_topic", "/traffic_stop")' in viewer
+    assert "self._on_traffic_stop" in viewer
+    assert "TRAFFIC={traffic_command}" in viewer
+    assert "RED/YELLOW=STOP, GREEN/LEFT=GO" in viewer
     assert "create_publisher(\n            CompressedImage" in viewer
     assert "create_publisher(\n            Float32MultiArray" not in viewer
+
+
+def test_signal_test_uses_read_only_live_viewer_without_drive_nodes():
+    source = (ROOT / "launch" / "signal_test.launch.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'executable="yolo_bev"' in source
+    assert 'executable="live_pipeline_viewer"' in source
+    assert 'executable="signal_preview"' not in source
+    assert '"publish_signal_preview": True' in source
+    assert '"publish_compressed": False' in source
+    assert '"motion_topic": "/debug/xycar_motor_signal_test_unused"' in source
+    for forbidden in (
+        'executable="cnn_path"',
+        'executable="cnn_drive_gate"',
+        'executable="simple_motion"',
+        'executable="cnn_motion"',
+        '"/xycar_motor"',
+        "dynamic_bridge",
+        "motor_up",
+    ):
+        assert forbidden not in source

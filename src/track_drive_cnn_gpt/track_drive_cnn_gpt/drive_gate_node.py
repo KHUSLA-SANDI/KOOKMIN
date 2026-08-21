@@ -63,6 +63,7 @@ class DriveGateLogic:
         self.path_stale_sec = float(path_stale_sec)
         self.manual_go = False
         self.emergency_stop = False
+        self.traffic_stop = False
         self.path_source_time: Optional[float] = None
 
     def set_manual_go(self, enabled: bool) -> None:
@@ -70,6 +71,9 @@ class DriveGateLogic:
 
     def set_emergency_stop(self, active: bool) -> None:
         self.emergency_stop = bool(active)
+
+    def set_traffic_stop(self, active: bool) -> None:
+        self.traffic_stop = bool(active)
 
     def update_path(self, source_time: Optional[float]) -> None:
         if source_time is None or not math.isfinite(float(source_time)):
@@ -82,6 +86,8 @@ class DriveGateLogic:
             return DriveGateDecision(False, "drive_disabled")
         if self.emergency_stop:
             return DriveGateDecision(False, "emergency_stop")
+        if self.traffic_stop:
+            return DriveGateDecision(False, "traffic_signal_stop")
         if not self.manual_go:
             return DriveGateDecision(False, "manual_go_required")
         if self.path_source_time is None or not math.isfinite(float(now)):
@@ -113,6 +119,7 @@ if rclpy is not None:
             self.declare_parameter("drive_cmd_topic", "/drive_cmd")
             self.declare_parameter("manual_go_topic", "/manual_go")
             self.declare_parameter("emergency_stop_topic", "/emergency_stop")
+            self.declare_parameter("traffic_stop_topic", "/traffic_stop")
             self.declare_parameter("control_hz", 20.0)
             self.declare_parameter("path_stale_sec", 0.25)
             self.declare_parameter("path_future_tolerance_sec", 0.05)
@@ -158,6 +165,12 @@ if rclpy is not None:
                 Bool,
                 str(self.get_parameter("emergency_stop_topic").value),
                 lambda msg: self._logic.set_emergency_stop(msg.data),
+                10,
+            )
+            self.create_subscription(
+                Bool,
+                str(self.get_parameter("traffic_stop_topic").value),
+                lambda msg: self._logic.set_traffic_stop(msg.data),
                 10,
             )
             self._drive_pub = self.create_publisher(

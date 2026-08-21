@@ -47,7 +47,9 @@ def generate_launch_description():
         # remains explicitly disabled by default.
         DeclareLaunchArgument("enable_drive_gate", default_value="false"),
         DeclareLaunchArgument("enable_drive", default_value="false"),
-        DeclareLaunchArgument("speed_cap", default_value="5.0"),
+        # Actual NORMAL/CONE speeds live in simple_motion.yaml.  This launch
+        # value is only a global upper bound carried by /drive_cmd.
+        DeclareLaunchArgument("speed_cap", default_value="10.0"),
         DeclareLaunchArgument("ros_domain_id", default_value="7"),
         SetEnvironmentVariable(
             "FASTRTPS_DEFAULT_PROFILES_FILE", dds_profile

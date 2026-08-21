@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Combine full-topology camera BEV with LiDAR and run the path CNN.
+"""Combine full-topology camera BEV with mode-specific LiDAR and run the path CNN.
 
-The input BEV message contains yellow/white channels only.  This node selects
-the nearest received LaserScan, obtains a camera-only reference path, compacts
-one unambiguous obstacle cluster into the training LiDAR domain, and predicts
-sanitized main and shortcut paths.  The same-pass YOLO signal topic is consumed
-here: confirmed LEFT latches shortcut, then the selected path is published
-directly on ``/center_path`` for motion.  It never republishes an old
-prediction with a new stamp.
+The input BEV message contains yellow/white channels only.  A white-boundary
+filter creates the training-time ``lidar_filtered`` channel for GENERAL,
+SHORTCUT, and OVERTAKE.  CONE receives the calibrated/self-masked raw LiDAR
+without the outside-white removal.  Exactly one of four resident CNNs runs per
+frame and publishes directly on ``/center_path``.  Confirmed LEFT,
+conservative in-road LiDAR evidence, and START_R select fixed-duration modes.
+RED/YELLOW stop remains an orthogonal drive-gate decision.
 """
 
 from __future__ import annotations
@@ -32,7 +32,14 @@ from rclpy.qos import (
 from sensor_msgs.msg import Image, LaserScan
 from std_msgs.msg import Bool, String
 
-from .lidar_compact import compact_obstacle_points
+from .cnn_modes import (
+    MODE_CONE,
+    MODE_GENERAL,
+    MODE_OVERTAKE,
+    MODE_SHORTCUT,
+    CnnModeController,
+    ConfirmedOneShot,
+)
 from .lidar_geometry import (
     GRID_H,
     GRID_W,
@@ -48,12 +55,12 @@ from .path_contract import (
     count_camera_evidence,
 )
 from .path_model import load_path_model
+from .road_lidar_filter import filter_and_detect_in_road, reference_from_mid_grid
 from .signal_mission import (
     ROUTE_MAIN,
     ROUTE_SHORTCUT,
-    SequencedRouteIntentLatch,
-    decode_signal_payload,
-    select_route_value,
+    TrafficMissionController,
+    decode_signal_payload_full,
 )
 
 
@@ -98,17 +105,55 @@ class CnnPathNode(Node):
         main_topic = str(p("main_path_topic", "/cnn/path_main"))
         shortcut_topic = str(p("shortcut_path_topic", "/cnn/path_shortcut"))
         center_topic = str(p("center_path_topic", "/center_path"))
+        cnn_input_bev_topic = str(
+            p("cnn_input_bev_topic", "/debug/cnn_input_bev")
+        )
         signal_topic = str(p("signal_topic", "/perception/signals"))
         route_intent_topic = str(p("route_intent_topic", "/route_intent"))
         route_reset_topic = str(p("route_reset_topic", "/route_intent_reset"))
-        self._enable_center_path = bool(p("enable_center_path", True))
-        self._route_logic = SequencedRouteIntentLatch(
-            left_confirm_frames=int(p("left_confirm_frames", 2)),
-            left_confidence=float(p("left_confidence", 0.25)),
+        traffic_stop_topic = str(p("traffic_stop_topic", "/traffic_stop"))
+        traffic_stop_reset_topic = str(
+            p("traffic_stop_reset_topic", "/traffic_stop_reset")
         )
+        cone_trigger_topic = str(
+            p("cone_trigger_topic", "/perception/cone_trigger")
+        )
+        self._mode_topic = str(p("cnn_mode_topic", "/cnn_mode"))
+        self._cone_mode_topic = str(p("cone_mode_topic", "/cone_mode"))
+        self._enable_center_path = bool(p("enable_center_path", True))
+        shortcut_hold_sec = float(p("shortcut_hold_sec", 10.0))
+        self._mission = TrafficMissionController(
+            confirm_frames=int(p("left_confirm_frames", 2)),
+            confidence=float(p("left_confidence", 0.25)),
+            shortcut_hold_sec=shortcut_hold_sec,
+            left_confirm_window_sec=float(p("left_confirm_window_sec", 1.5)),
+            decision_center_y_max=float(p("signal_decision_center_y_max", 0.22)),
+            decision_min_width=float(p("signal_decision_min_width", 0.08)),
+            left_rearm_absent_frames=int(p("left_rearm_absent_frames", 3)),
+        )
+        self._mode_controller = CnnModeController(
+            shortcut_hold_sec=shortcut_hold_sec,
+            overtake_hold_sec=float(p("overtake_hold_sec", 7.0)),
+            cone_hold_sec=float(p("cone_hold_sec", 20.0)),
+        )
+        self._overtake_latch = ConfirmedOneShot(
+            confirm_frames=int(p("overtake_confirm_frames", 2)),
+            rearm_clear_frames=int(p("overtake_rearm_clear_frames", 5)),
+        )
+        self._cone_trigger_high = False
+        self._last_route_intent = ROUTE_MAIN
+        self._last_published_mode = ""
         self._last_center_message: Optional[PoseArray] = None
-        model_path = str(p("model_path", ""))
-        expected_model_sha256 = str(p("expected_model_sha256", ""))
+        legacy_model_path = str(p("model_path", ""))
+        legacy_model_sha = str(p("expected_model_sha256", ""))
+        general_model_path = str(p("general_model_path", legacy_model_path))
+        general_model_sha = str(p("general_expected_sha256", legacy_model_sha))
+        shortcut_model_path = str(p("shortcut_model_path", general_model_path))
+        shortcut_model_sha = str(p("shortcut_expected_sha256", general_model_sha))
+        overtake_model_path = str(p("overtake_model_path", general_model_path))
+        overtake_model_sha = str(p("overtake_expected_sha256", general_model_sha))
+        cone_model_path = str(p("cone_model_path", general_model_path))
+        cone_model_sha = str(p("cone_expected_sha256", ""))
         device = str(p("device", "cpu"))
         torch_threads = int(p("torch_threads", 2))
         allow_unverified_legacy = bool(p("allow_unverified_legacy", False))
@@ -120,26 +165,37 @@ class CnnPathNode(Node):
         self._self_y = float(p("lidar_self_y_abs", 0.15))
         self._lidar_radius = int(p("lidar_radius_cells", 1))
         self._min_camera_cells = int(p("min_camera_cells", 1))
-        self._min_lidar_cells = int(p("min_lidar_cells", 27))
-        self._max_lidar_cells = int(p("max_lidar_cells", 67))
-        self._lidar_preprocess_mode = str(
-            p("lidar_preprocess_mode", "compact_reference")
-        ).strip().lower()
-        self._lidar_fov_deg = float(p("lidar_fov_deg", 110.0))
-        self._lidar_corridor_half_width = float(
-            p("lidar_corridor_half_width_m", 0.70)
+        self._model_lidar_safety_margin = float(
+            p("model_lidar_safety_margin_m", 0.025)
         )
-        self._lidar_cluster_gap_base = float(
-            p("lidar_cluster_gap_base_m", 0.12)
+        self._model_white_guard = float(p("model_white_guard_m", 0.025))
+        # User-selected trigger contract: at least 10 cm inside both white
+        # boundaries and before the x=1.2 m forward line.
+        self._overtake_inward_margin = float(
+            p("overtake_inward_margin_m", 0.10)
         )
-        self._lidar_cluster_gap_per_m = float(
-            p("lidar_cluster_gap_per_m", 0.03)
+        self._overtake_white_guard = float(p("overtake_white_guard_m", 0.05))
+        self._overtake_x_min = float(p("overtake_x_min_m", 0.0))
+        self._overtake_x_max = float(p("overtake_x_max_m", 1.20))
+        self._overtake_min_points = int(p("overtake_min_raw_points", 3))
+        self._overtake_min_inside_ratio = float(
+            p("overtake_min_inside_ratio", 0.50)
         )
-        self._lidar_min_cluster_points = int(p("lidar_min_cluster_points", 3))
-        self._lidar_max_cluster_extent = float(
-            p("lidar_max_cluster_extent_m", 0.72)
+        self._overtake_min_road_width = float(
+            p("overtake_min_road_width_m", 0.35)
         )
-        self._lidar_max_clusters = int(p("lidar_max_clusters", 1))
+        self._overtake_max_road_width = float(
+            p("overtake_max_road_width_m", 1.50)
+        )
+        self._overtake_cluster_gap_base = float(
+            p("overtake_cluster_gap_base_m", 0.15)
+        )
+        self._overtake_cluster_gap_per_m = float(
+            p("overtake_cluster_gap_per_m", 0.03)
+        )
+        self._overtake_max_cluster_extent = float(
+            p("overtake_max_cluster_extent_m", 0.90)
+        )
         self._camera_scan_offset_ns = int(
             float(p("camera_to_scan_offset_sec", 0.0)) * 1e9
         )
@@ -162,34 +218,14 @@ class CnnPathNode(Node):
             raise ValueError("lidar_radius_cells must be non-negative")
         if self._min_camera_cells < 0:
             raise ValueError("min_camera_cells must be non-negative")
-        if self._min_lidar_cells < 0 or self._max_lidar_cells < self._min_lidar_cells:
-            raise ValueError("LiDAR cell limits must satisfy 0 <= min <= max")
-        if self._lidar_preprocess_mode not in ("raw_gate", "compact_reference"):
+        if not np.isclose(self._overtake_inward_margin, 0.10, rtol=0.0, atol=1e-9):
             raise ValueError(
-                "lidar_preprocess_mode must be raw_gate or compact_reference"
+                "overtake_inward_margin_m is fixed to the approved 0.10 m contract"
             )
-        if not 0.0 < self._lidar_fov_deg <= 180.0:
-            raise ValueError("lidar_fov_deg must be in (0, 180]")
-        if not np.isfinite(
-            [
-                self._lidar_fov_deg,
-                self._lidar_corridor_half_width,
-                self._lidar_cluster_gap_base,
-                self._lidar_cluster_gap_per_m,
-                self._lidar_max_cluster_extent,
-            ]
-        ).all():
-            raise ValueError("LiDAR compact geometry limits must be finite")
-        if min(
-            self._lidar_corridor_half_width,
-            self._lidar_cluster_gap_base,
-            self._lidar_max_cluster_extent,
-        ) <= 0.0:
-            raise ValueError("LiDAR compact geometry limits must be positive")
-        if self._lidar_cluster_gap_per_m < 0.0:
-            raise ValueError("lidar_cluster_gap_per_m must be non-negative")
-        if self._lidar_min_cluster_points < 1 or self._lidar_max_clusters < 1:
-            raise ValueError("LiDAR compact count limits must be positive")
+        if not np.isclose(self._overtake_x_max, 1.20, rtol=0.0, atol=1e-9):
+            raise ValueError(
+                "overtake_x_max_m is fixed to the approved 1.20 m forward line"
+            )
 
         guard = PathGuardConfig(
             valid_threshold=float(p("valid_threshold", 0.50)),
@@ -204,28 +240,46 @@ class CnnPathNode(Node):
         import torch
 
         torch.set_num_threads(max(1, torch_threads))
-        self._path_model = load_path_model(
-            model_path,
-            device=device,
-            guard=guard,
-            expected_sha256=expected_model_sha256,
-        )
-        if self._path_model.model_kind == MODEL_KIND_LEGACY and not allow_unverified_legacy:
-            raise RuntimeError(
-                "legacy checkpoint execution is disabled. Retrain/save a canonical "
-                "dual checkpoint or set allow_unverified_legacy=true only for an "
-                "offline comparison."
-            )
+        model_specs = {
+            MODE_GENERAL: (general_model_path, general_model_sha),
+            MODE_SHORTCUT: (shortcut_model_path, shortcut_model_sha),
+            MODE_OVERTAKE: (overtake_model_path, overtake_model_sha),
+            MODE_CONE: (cone_model_path, cone_model_sha),
+        }
+        cache = {}
+        self._path_models = {}
+        for mode, (path, expected_sha) in model_specs.items():
+            key = (str(path), str(expected_sha).strip().lower())
+            if key not in cache:
+                cache[key] = load_path_model(
+                    path,
+                    device=device,
+                    guard=guard,
+                    expected_sha256=expected_sha,
+                )
+            model = cache[key]
+            if model.model_kind == MODEL_KIND_LEGACY and not allow_unverified_legacy:
+                raise RuntimeError(
+                    f"legacy checkpoint execution is disabled for {mode}"
+                )
+            self._path_models[mode] = model
 
         # (receive time, scan-ordered calibrated points, raw raster cell count)
         self._scan_history: Deque[Tuple[int, np.ndarray, int]] = deque()
+        self._last_road_reference: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self._last_bev_stamp_ns = -1
         self._last_scan_error_log_ns = -1
         self._main_pub = self.create_publisher(PoseArray, main_topic, 1)
         self._shortcut_pub = self.create_publisher(PoseArray, shortcut_topic, 1)
         self._center_pub = self.create_publisher(PoseArray, center_topic, 1)
         self._route_pub = self.create_publisher(String, route_intent_topic, 1)
+        self._traffic_stop_pub = self.create_publisher(Bool, traffic_stop_topic, 1)
+        self._mode_pub = self.create_publisher(String, self._mode_topic, 1)
+        self._cone_mode_pub = self.create_publisher(Bool, self._cone_mode_topic, 1)
         self._diag_pub = self.create_publisher(String, "/debug/cnn_path", 10)
+        self._cnn_input_bev_pub = self.create_publisher(
+            Image, cnn_input_bev_topic, LATEST_QOS
+        )
         self.create_subscription(
             LaserScan,
             self._scan_topic,
@@ -234,49 +288,129 @@ class CnnPathNode(Node):
         )
         self.create_subscription(Image, self._bev_topic, self._on_bev, LATEST_QOS)
         self.create_subscription(String, signal_topic, self._on_signals, 1)
+        self.create_subscription(Bool, cone_trigger_topic, self._on_cone_trigger, 1)
         self.create_subscription(Bool, route_reset_topic, self._on_route_reset, 1)
+        self.create_subscription(
+            Bool,
+            traffic_stop_reset_topic,
+            self._on_traffic_stop_reset,
+            1,
+        )
+        kinds = {mode: model.model_kind for mode, model in self._path_models.items()}
         self.get_logger().info(
-            f"CNN path ready kind={self._path_model.model_kind} "
-            f"input={INPUT_SHAPE} device={device} "
-            f"lidar_mode={self._lidar_preprocess_mode} "
-            f"direct_center_path={str(self._enable_center_path).lower()}"
+            f"four-mode CNN path ready kinds={kinds} input={INPUT_SHAPE} "
+            f"device={device} direct_center_path={str(self._enable_center_path).lower()}"
         )
 
     def _parameter(self, name, default):
         self.declare_parameter(name, default)
         return self.get_parameter(name).value
 
+    def _now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _current_route(self) -> str:
+        mode = self._mode_controller.snapshot(self._now_sec()).mode
+        return ROUTE_SHORTCUT if mode == MODE_SHORTCUT else ROUTE_MAIN
+
+    def _current_mode(self):
+        snapshot = self._mode_controller.snapshot(self._now_sec())
+        if snapshot.changed:
+            self.get_logger().info("CNN mode timer ended: GENERAL")
+        return snapshot
+
+    def _publish_mode(self, snapshot=None) -> None:
+        state = snapshot or self._current_mode()
+        self._mode_pub.publish(String(data=state.mode))
+        self._cone_mode_pub.publish(Bool(data=state.mode == MODE_CONE))
+        if state.mode != self._last_published_mode:
+            self.get_logger().info(
+                f"CNN mode changed: {state.mode} reason={state.reason} "
+                f"remaining={state.remaining_sec:.1f}s"
+            )
+            self._last_published_mode = state.mode
+
     def _publish_route_intent(self) -> None:
+        route = self._current_route()
         message = String()
-        message.data = self._route_logic.route_intent
+        message.data = route
         self._route_pub.publish(message)
+        if route != self._last_route_intent:
+            self.get_logger().info(f"direct path route changed: {route}")
+            self._last_route_intent = route
+
+    def _publish_traffic_stop(self) -> None:
+        message = Bool()
+        message.data = bool(self._mission.traffic_stop)
+        self._traffic_stop_pub.publish(message)
 
     def _on_signals(self, message: String) -> None:
         """Update the route latch from the same YOLO pass used for BEV."""
 
         try:
-            sequence, signals = decode_signal_payload(message.data)
+            sequence, signals, detections = decode_signal_payload_full(message.data)
         except ValueError as exc:
             self.get_logger().warning(
                 f"rejected signal payload: {exc}",
                 throttle_duration_sec=1.0,
             )
             return
-        update = self._route_logic.observe(sequence, signals)
+        update = self._mission.observe(
+            sequence,
+            signals,
+            detections,
+            now_sec=self._now_sec(),
+        )
         if not update.accepted:
             return
         if update.source_restarted:
             self.get_logger().warning(
-                "YOLO signal sequence restarted; LEFT confirmation streak reset"
+                "YOLO signal sequence restarted; signal confirmation streaks reset"
             )
         if update.route_changed:
-            self.get_logger().info("direct path route latched: shortcut")
+            if update.route_intent == ROUTE_SHORTCUT:
+                mode = self._mode_controller.trigger(
+                    MODE_SHORTCUT,
+                    now_sec=self._now_sec(),
+                    reason="left_signal_confirmed",
+                )
+                self.get_logger().info(
+                    "LEFT confirmed: shortcut selected for %.1f seconds"
+                    % self._mission.shortcut_hold_sec
+                )
+                self._publish_mode(mode)
+            else:
+                self.get_logger().info(
+                    f"signal decision selected main: {update.dominant_signal}"
+                )
             self._publish_route_intent()
+        if update.stop_changed:
+            state = "STOP" if update.traffic_stop else "GO"
+            self.get_logger().warning(
+                f"traffic decision changed: {state} signal={update.dominant_signal}"
+            )
+        self._publish_traffic_stop()
+
+    def _on_cone_trigger(self, message: Bool) -> None:
+        detected = bool(message.data)
+        rising = detected and not self._cone_trigger_high
+        self._cone_trigger_high = detected
+        if not rising:
+            return
+        mode = self._mode_controller.trigger(
+            MODE_CONE,
+            now_sec=self._now_sec(),
+            reason="start_r_confirmed",
+        )
+        self._publish_mode(mode)
 
     def _on_route_reset(self, message: Bool) -> None:
         if not message.data:
             return
-        self._route_logic.reset_main()
+        self._mission.reset_route()
+        mode = self._mode_controller.reset(
+            now_sec=self._now_sec(), reason="route_reset"
+        )
         # The previous shortcut must not remain cached in motion until the
         # next camera frame.  Invalidate it using the original source stamp;
         # never make an old path look new by assigning the reset time.
@@ -290,7 +424,15 @@ class CnnPathNode(Node):
             self._center_pub.publish(invalid)
             self._last_center_message = invalid
         self.get_logger().info("direct path route explicitly reset: main")
+        self._publish_mode(mode)
         self._publish_route_intent()
+
+    def _on_traffic_stop_reset(self, message: Bool) -> None:
+        if not message.data:
+            return
+        self._mission.reset_stop()
+        self._publish_traffic_stop()
+        self.get_logger().warning("traffic STOP explicitly reset")
 
     def _publish_center(self, path: SanitizedPath, header) -> SanitizedPath:
         published = path
@@ -299,6 +441,7 @@ class CnnPathNode(Node):
         message = path_message(published, header)
         self._center_pub.publish(message)
         self._last_center_message = message
+        self._publish_mode()
         self._publish_route_intent()
         return published
 
@@ -368,18 +511,43 @@ class CnnPathNode(Node):
             raise ValueError("incoming BEV lidar channel must be empty")
         return chw
 
+    def _publish_cnn_input_bev(self, values: np.ndarray, header) -> None:
+        """Publish the exact semantic 3-channel tensor before float conversion."""
+
+        # This image is diagnostic-only.  Avoid a transpose, allocation,
+        # serialization and DDS publish on every control frame when neither
+        # the live viewer nor the recorder is connected.  Subscription counts
+        # are checked each call, so a viewer started later begins receiving
+        # frames without restarting the driving pipeline.
+        if self._cnn_input_bev_pub.get_subscription_count() <= 0:
+            return
+
+        message = Image()
+        message.header.stamp = header.stamp
+        message.header.frame_id = "lidar_frame"
+        message.height = GRID_H
+        message.width = GRID_W
+        message.encoding = "8UC3"
+        message.is_bigendian = False
+        message.step = GRID_W * 3
+        hwc = np.ascontiguousarray(np.transpose(values, (1, 2, 0)))
+        message.data = hwc.tobytes()
+        self._cnn_input_bev_pub.publish(message)
+
     def _publish_empty(self, header, reason: str, **extra) -> None:
         empty = self._invalid_path(reason)
         self._main_pub.publish(path_message(empty, header))
         self._shortcut_pub.publish(path_message(empty, header))
         selected = self._publish_center(empty, header)
+        route = self._current_route()
         payload = {
             "ok": False,
             "reason": reason,
-            "route_intent": self._route_logic.route_intent,
-            "selected_route": self._route_logic.route_intent,
+            "route_intent": route,
+            "selected_route": route,
             "selected_usable": selected.usable,
             "selected_reason": selected.reason,
+            "traffic_stop": bool(self._mission.traffic_stop),
             **extra,
         }
         self._diag_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
@@ -421,6 +589,7 @@ class CnnPathNode(Node):
         except ValueError as exc:
             self._publish_empty(message.header, f"bad_bev:{exc}")
             return
+        decoded_at = time.perf_counter()
         camera_cells = count_camera_evidence(values)
         if camera_cells < self._min_camera_cells:
             self._publish_empty(
@@ -443,172 +612,176 @@ class CnnPathNode(Node):
             (_scan_ns, raw_lidar_points, raw_lidar_cells), delta_ns = matched
             scan_delta_ms = delta_ns * 1e-6
 
-        compact_diag = None
-        cnn_passes = 1
-        if self._lidar_preprocess_mode == "raw_gate":
-            lidar = points_to_grid(
-                raw_lidar_points, radius_cells=self._lidar_radius
-            )
-            lidar_points = int(raw_lidar_points.shape[0])
-            values[2] = lidar
+        mode_state = self._current_mode()
+        fallback_x, fallback_y = reference_from_mid_grid(values[0])
+        if fallback_x.size >= 2:
+            reference = (fallback_x, fallback_y)
+            reference_source = "current_mid"
         else:
-            # Pass 1 deliberately uses the all-zero clean channel found in
-            # 8,022 training samples. Its main path defines a curve-aware road
-            # corridor, so fixed |y| filtering is not used on bends.
+            reference = self._last_road_reference
+            reference_source = (
+                "previous_selected_path" if reference is not None else "unavailable"
+            )
+
+        road_diag = {
+            "reference": reference_source,
+            "trigger_detected": False,
+        }
+        raw_lidar_grid = points_to_grid(
+            raw_lidar_points, radius_cells=self._lidar_radius
+        )
+        filtered_points = np.empty((0, 2), dtype=np.float32)
+        lidar_preprocess = "basic_range_self_only"
+        if mode_state.mode == MODE_CONE:
+            # The CONE checkpoint was trained with LiDAR before the
+            # outside-white removal.  Range calibration and ego self-return
+            # removal are sensor corrections and remain active.
+            lidar = raw_lidar_grid
+            lidar_points = int(raw_lidar_points.shape[0])
+            road_diag["reference"] = "not_evaluated_in_cone"
+            self._overtake_latch.observe(False)
+        elif reference is not None:
+            lidar_preprocess = "outside_white_removed"
             try:
-                clean_bundle = self._path_model.predict(values)
-            except Exception as exc:
-                self.get_logger().error(f"CNN clean-reference inference failed: {exc}")
-                self._publish_empty(message.header, "inference_error_clean_reference")
-                return
-            if not clean_bundle.main.usable:
-                self._publish_empty(
-                    message.header,
-                    "camera_only_reference_unusable",
-                    reference_reason=clean_bundle.main.reason,
-                    raw_lidar_points=int(raw_lidar_points.shape[0]),
-                    raw_lidar_cells=raw_lidar_cells,
-                )
-                return
-            try:
-                compact = compact_obstacle_points(
+                road = filter_and_detect_in_road(
                     raw_lidar_points,
-                    clean_bundle.main.x,
-                    clean_bundle.main.y,
-                    fov_deg=self._lidar_fov_deg,
-                    corridor_half_width_m=self._lidar_corridor_half_width,
-                    cluster_gap_base_m=self._lidar_cluster_gap_base,
-                    cluster_gap_per_m=self._lidar_cluster_gap_per_m,
-                    min_cluster_points=self._lidar_min_cluster_points,
-                    max_cluster_extent_m=self._lidar_max_cluster_extent,
-                    max_clusters=self._lidar_max_clusters,
+                    values[1],
+                    reference[0],
+                    reference[1],
+                    model_safety_margin_m=self._model_lidar_safety_margin,
+                    model_white_guard_m=self._model_white_guard,
+                    trigger_inward_margin_m=self._overtake_inward_margin,
+                    trigger_white_guard_m=self._overtake_white_guard,
+                    trigger_x_min_m=self._overtake_x_min,
+                    trigger_x_max_m=self._overtake_x_max,
+                    trigger_min_points=self._overtake_min_points,
+                    trigger_min_inside_ratio=self._overtake_min_inside_ratio,
+                    trigger_min_road_width_m=self._overtake_min_road_width,
+                    trigger_max_road_width_m=self._overtake_max_road_width,
+                    cluster_gap_base_m=self._overtake_cluster_gap_base,
+                    cluster_gap_per_m=self._overtake_cluster_gap_per_m,
+                    max_cluster_extent_m=self._overtake_max_cluster_extent,
                 )
             except ValueError as exc:
                 self._publish_empty(
                     message.header,
-                    "lidar_preprocess_error",
+                    "road_lidar_filter_error",
                     detail=str(exc),
-                    raw_lidar_points=int(raw_lidar_points.shape[0]),
-                    raw_lidar_cells=raw_lidar_cells,
                 )
                 return
-            compact_diag = {
-                "reason": compact.reason,
-                "raw_fov_points": compact.raw_fov_points,
-                "corridor_points": compact.corridor_points,
-                "corridor_clusters": compact.corridor_clusters,
-                "selected_raw_points": compact.selected_raw_points,
-                "selected_extent_m": round(compact.selected_extent_m, 3),
-            }
-            if not compact.usable:
-                self._publish_empty(
-                    message.header,
-                    f"lidar_preprocess_ambiguous:{compact.reason}",
-                    lidar_preprocess=compact_diag,
-                    raw_lidar_points=int(raw_lidar_points.shape[0]),
-                    raw_lidar_cells=raw_lidar_cells,
-                    scan_delta_ms=(
-                        None if scan_delta_ms is None else round(scan_delta_ms, 2)
-                    ),
-                )
-                return
-            lidar = points_to_grid(compact.points, radius_cells=self._lidar_radius)
-            lidar_points = int(compact.points.shape[0])
-            if compact.obstacle_present:
-                values[2] = lidar
-            else:
-                bundle = clean_bundle
-
-        lidar_cells = occupied_cell_count(lidar)
-        if lidar_cells != 0 and not (
-            self._min_lidar_cells <= lidar_cells <= self._max_lidar_cells
-        ):
-            self._publish_empty(
-                message.header,
-                "lidar_occupancy_out_of_training_domain",
-                lidar_cells=lidar_cells,
-                min_lidar_cells=self._min_lidar_cells,
-                max_lidar_cells=self._max_lidar_cells,
-                lidar_points=lidar_points,
-                raw_lidar_points=int(raw_lidar_points.shape[0]),
-                raw_lidar_cells=raw_lidar_cells,
-                lidar_preprocess=compact_diag,
-                scan_delta_ms=(
-                    None if scan_delta_ms is None else round(scan_delta_ms, 2)
-                ),
+            filtered_points = road.filtered_points
+            road_diag.update(
+                {
+                    "trigger_detected": road.trigger_detected,
+                    "trigger_cluster_points": road.trigger_cluster_points,
+                    "trigger_inside_points": road.trigger_inside_points,
+                    "reliable_boundary_rows": road.reliable_rows,
+                    "removed_outside_points": road.removed_points,
+                }
             )
+            # Feed the real detection state even while another mode owns the
+            # path.  Treating "mode is not GENERAL" as a clear frame would
+            # re-arm the one-shot while the same obstacle is still present,
+            # causing another 7-second window immediately after expiry.
+            overtake_event = self._overtake_latch.observe(road.trigger_detected)
+            trigger_allowed = (
+                mode_state.mode == MODE_GENERAL and not self._cone_trigger_high
+            )
+            if overtake_event and trigger_allowed:
+                mode_state = self._mode_controller.trigger(
+                    MODE_OVERTAKE,
+                    now_sec=self._now_sec(),
+                    reason="in_road_lidar_confirmed",
+                )
+                self._publish_mode(mode_state)
+            lidar = points_to_grid(
+                filtered_points, radius_cells=self._lidar_radius
+            )
+            lidar_points = int(filtered_points.shape[0])
+        else:
+            # No trustworthy road reference yet: keep the model channel clean
+            # for this first frame and never fabricate OVERTAKE evidence.
+            self._overtake_latch.observe(False)
+            road_diag["reference"] = "unavailable"
+            lidar_preprocess = "outside_white_removed_no_reference"
+            lidar = np.zeros((GRID_H, GRID_W), dtype=np.uint8)
+            lidar_points = 0
+
+        values[2] = lidar
+        lidar_cells = occupied_cell_count(lidar)
+        preprocessed_at = time.perf_counter()
+        self._publish_cnn_input_bev(values, message.header)
+        debug_published_at = time.perf_counter()
+
+        active_model = self._path_models[mode_state.mode]
+        try:
+            bundle = active_model.predict(values)
+        except Exception as exc:
+            self.get_logger().error(
+                f"CNN inference failed mode={mode_state.mode}: {exc}"
+            )
+            self._publish_empty(message.header, "inference_error")
             return
+        inferred_at = time.perf_counter()
 
-        if self._lidar_preprocess_mode == "raw_gate":
-            try:
-                bundle = self._path_model.predict(values)
-            except Exception as exc:
-                self.get_logger().error(f"CNN inference failed: {exc}")
-                self._publish_empty(message.header, "inference_error")
-                return
-        elif lidar_points:
-            try:
-                bundle = self._path_model.predict(values)
-            except Exception as exc:
-                self.get_logger().error(f"CNN obstacle inference failed: {exc}")
-                self._publish_empty(message.header, "inference_error_obstacle")
-                return
-            cnn_passes = 2
+        selected_path = bundle.main
+        if mode_state.mode != MODE_CONE and selected_path.usable:
+            self._last_road_reference = (
+                selected_path.x.copy(),
+                selected_path.y.copy(),
+            )
 
-        # Availability is part of the canonical shortcut contract, but the ROS
-        # interface carries paths only.  Publish an empty shortcut when the
-        # availability gate is closed so the supervisor cannot select it.
-        published_shortcut = (
-            bundle.shortcut
-            if bundle.shortcut_available
-            else self._invalid_path("shortcut_unavailable")
+        empty_other = self._invalid_path("inactive_mode_model")
+        diagnostic_main = (
+            empty_other if mode_state.mode == MODE_SHORTCUT else selected_path
         )
-        self._main_pub.publish(path_message(bundle.main, message.header))
-        self._shortcut_pub.publish(path_message(published_shortcut, message.header))
-        selected_route = self._route_logic.route_intent
-        selected_path = select_route_value(
-            selected_route,
-            bundle.main,
-            published_shortcut,
+        diagnostic_shortcut = (
+            selected_path if mode_state.mode == MODE_SHORTCUT else empty_other
         )
+        self._main_pub.publish(path_message(diagnostic_main, message.header))
+        self._shortcut_pub.publish(path_message(diagnostic_shortcut, message.header))
         published_selected = self._publish_center(selected_path, message.header)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        published_at = time.perf_counter()
+        elapsed_ms = (published_at - started) * 1000.0
         payload = {
             "ok": bool(published_selected.usable),
-            "model_kind": self._path_model.model_kind,
-            "main": {
-                "usable": bundle.main.usable,
-                "reason": bundle.main.reason,
-                "points": bundle.main.point_count,
-                "span_m": round(bundle.main.span_m, 3),
-            },
-            "shortcut": {
-                "usable": bundle.shortcut_available,
-                "reason": published_shortcut.reason,
-                "points": published_shortcut.point_count,
-                "probability": (
-                    round(bundle.shortcut_probability, 4)
-                    if bundle.shortcut_availability_source == "availability_head"
-                    else None
-                ),
-                "availability_source": bundle.shortcut_availability_source,
-            },
-            "route_intent": selected_route,
-            "selected_route": selected_route,
+            "cnn_mode": mode_state.mode,
+            "mode_remaining_sec": round(mode_state.remaining_sec, 2),
+            "mode_reason": mode_state.reason,
+            "model_kind": active_model.model_kind,
+            "selected_route": "shortcut" if mode_state.mode == MODE_SHORTCUT else "main",
             "selected_usable": published_selected.usable,
             "selected_reason": published_selected.reason,
-            "left_streak": self._route_logic.left_streak,
-            "last_signal_sequence": self._route_logic.last_sequence,
+            "selected_points": published_selected.point_count,
+            "left_streak": self._mission.left_streak,
+            "last_signal_sequence": self._mission.last_sequence,
+            "traffic_stop": bool(self._mission.traffic_stop),
             "camera_cells": camera_cells,
-            "lidar_preprocess_mode": self._lidar_preprocess_mode,
-            "lidar_preprocess": compact_diag,
+            "lidar_preprocess_mode": lidar_preprocess,
+            "road_lidar": road_diag,
+            "cone_trigger_raw": bool(self._cone_trigger_high),
+            "overtake_confirm_count": self._overtake_latch.positive_count,
+            "overtake_confirm_frames": self._overtake_latch.confirm_frames,
+            "overtake_trigger_armed": self._overtake_latch.armed,
             "raw_lidar_points": int(raw_lidar_points.shape[0]),
             "raw_lidar_cells": raw_lidar_cells,
-            "lidar_points": lidar_points,
+            "filtered_lidar_points": lidar_points,
+            "used_lidar_points": lidar_points,
             "lidar_cells": lidar_cells,
-            "cnn_passes": cnn_passes,
+            "cnn_passes": 1,
             "scan_delta_ms": None if scan_delta_ms is None else round(scan_delta_ms, 2),
             "source_age_ms": round(max(0, source_age_ns) * 1e-6, 2),
+            "bev_decode_ms": round((decoded_at - started) * 1000.0, 3),
+            "lidar_preprocess_ms": round(
+                (preprocessed_at - decoded_at) * 1000.0, 3
+            ),
+            "debug_bev_publish_ms": round(
+                (debug_published_at - preprocessed_at) * 1000.0, 3
+            ),
+            "cnn_inference_ms": round(
+                (inferred_at - debug_published_at) * 1000.0, 3
+            ),
+            "path_publish_ms": round((published_at - inferred_at) * 1000.0, 3),
             "cnn_total_ms": round(elapsed_ms, 3),
         }
         self._diag_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))

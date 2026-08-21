@@ -1,9 +1,29 @@
 motion_node:
   ros__parameters:
-    # 실제 튜닝값은 이 세 개뿐이다. 첫 저속 주행에서는 gain 하나만 바꾼다.
+    # GENERAL 구간 튜닝값. 실제 목표 속도도 이 파일이 소유한다.
     lookahead_m: 1.0
     steer_gain: 1.0
     steer_smooth_alpha: 0.40
+    speed_cmd: 5.0
+
+    # 전용 CNN이 도착하기 전에는 경로 모델과 motion 값 모두 GENERAL과 같다.
+    # 이후 아래 숫자와 checkpoint 경로만 독립적으로 교체한다.
+    shortcut_lookahead_m: 1.0
+    shortcut_steer_gain: 1.0
+    shortcut_steer_smooth_alpha: 0.40
+    shortcut_speed_cmd: 5.0
+
+    overtake_lookahead_m: 1.0
+    overtake_steer_gain: 1.0
+    overtake_steer_smooth_alpha: 0.40
+    overtake_speed_cmd: 5.0
+
+    # CONE 구간 임시 시작값. 새 trigger 모델과 현장 주행을 보고 확정한다.
+    cone_lookahead_m: 0.8
+    cone_steer_gain: 0.55
+    cone_steer_smooth_alpha: 0.35
+    cone_speed_cmd: 3.5
+    cnn_mode_topic: "/cnn_mode"
 
     # 아래는 튜닝 기능이 아니라 입력·안전 계약이다.
     control_hz: 20.0

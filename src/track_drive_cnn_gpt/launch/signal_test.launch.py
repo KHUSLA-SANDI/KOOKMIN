@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run camera + best_0817 signal preview only; never start CNN or drive nodes."""
+"""Run camera + configured YOLO signal preview; never start CNN or drive nodes."""
 
 import os
 
@@ -32,9 +32,23 @@ def generate_launch_description():
 
     viewer_node = Node(
         package="track_drive_cnn_gpt",
-        executable="signal_preview",
+        executable="live_pipeline_viewer",
         output="screen",
         condition=IfCondition(enable_viewer),
+        parameters=[
+            config_path,
+            {
+                "window_name": "Xycar YOLO signal test",
+                "screenshot_dir": "/home/xytron/signal_label_candidates_gpt",
+                # yolo_bev already publishes the annotated JPEG stream below;
+                # avoid a second dashboard JPEG encode in this light-weight test.
+                "publish_compressed": False,
+                # Keep this signal-only launch isolated from any motion topic
+                # that may exist in the same ROS domain.  The viewer is
+                # read-only, but showing stale steering data here is confusing.
+                "motion_topic": "/debug/xycar_motor_signal_test_unused",
+            },
+        ],
     )
 
     return LaunchDescription([
@@ -61,7 +75,7 @@ def generate_launch_description():
             parameters=[config_path, {"publish_signal_preview": True}],
         ),
         viewer_node,
-        # q/Esc closes the viewer process; make that stop camera and YOLO too.
+        # If the viewer process exits, stop camera and YOLO too.
         RegisterEventHandler(
             OnProcessExit(
                 target_action=viewer_node,

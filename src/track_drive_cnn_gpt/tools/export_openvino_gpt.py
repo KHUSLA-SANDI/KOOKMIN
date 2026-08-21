@@ -31,7 +31,7 @@ def sha256(path: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", type=Path, help="best_0817.pt")
+    parser.add_argument("model", type=Path, help="production YOLO .pt checkpoint")
     parser.add_argument(
         "--imgsz",
         type=int,

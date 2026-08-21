@@ -55,6 +55,17 @@ def test_emergency_stop_has_priority_over_manual_go_and_path():
     assert decision.reason == "emergency_stop"
 
 
+def test_traffic_signal_stop_blocks_and_releases_a_fresh_path():
+    logic = DriveGateLogic(enable_drive=True, path_stale_sec=0.25)
+    logic.set_manual_go(True)
+    logic.update_path(10.0)
+    logic.set_traffic_stop(True)
+    assert logic.decide(10.0).reason == "traffic_signal_stop"
+
+    logic.set_traffic_stop(False)
+    assert logic.decide(10.0).drive_allowed
+
+
 @pytest.mark.parametrize("stale_sec", [0.0, -1.0, float("nan")])
 def test_drive_gate_rejects_invalid_stale_policy(stale_sec):
     with pytest.raises(ValueError, match="path_stale_sec"):

@@ -84,7 +84,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "yolo_model_path",
-            default_value="/home/xytron/xycar_ws/models/best_0817_openvino_model",
+            default_value="/home/xytron/xycar_ws/models/best_v3_gpt_openvino_model",
         ),
         DeclareLaunchArgument(
             "cnn_model_path",

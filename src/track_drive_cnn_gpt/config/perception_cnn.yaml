@@ -4,14 +4,23 @@ yolo_bev_node:
     bev_topic: "/perception/bev"
     signal_topic: "/perception/signals"
     # 배포 시 실제 install 경로로 바꾼다. OpenVINO 검증 후에는 *_openvino_model 폴더.
-    model_path: "/home/xytron/xycar_ws/models/best_0817_openvino_model"
-    expected_model_sha256: "5d14778ed36ecc089fb5373d32c16a1a58c816faf05a925ec2647a93fd2d1cc9"
+    model_path: "/home/xytron/xycar_ws/models/best_v3_gpt_openvino_model"
+    expected_model_sha256: "8ab529d985af95489c46fbd8293a3c1677150bc518e5c9f59f4fe51d0e514c89"
     camera_yaml: "/home/xytron/xycar_ws/install/track_drive_cnn_gpt/share/track_drive_cnn_gpt/config/camera.yaml"
     # 1920x1080의 기존 PyTorch imgsz=640 auto-letterbox 실제 텐서와 동일.
     # OpenVINO export manifest도 반드시 static [384,640]이어야 한다.
     imgsz: [384, 640]
     conf: 0.25
     signal_conf: 0.25
+    # v3 데이터셋의 라바콘 구간 클래스 이름은 START_R이다.
+    # START_R 박스 하단이 화면 높이의 55% 아래로 내려온 상태가 2회 보이면
+    # raw trigger가 켜진다. 최종 20초 CONE 모드는 cnn_path_node가 소유한다.
+    cone_mode_topic: "/perception/cone_trigger"
+    cone_trigger_class_name: "START_R"
+    cone_trigger_conf: 0.25
+    cone_enter_bottom_y_min: 0.55
+    cone_enter_confirm_frames: 2
+    cone_exit_hold_sec: 1.0
     iou: 0.70
     device: "cpu"
     cv_threads: 4
@@ -28,16 +37,39 @@ cnn_path_node:
     # cnn_path가 직접 선택해 motion 입력으로 보낸다. main/shortcut 토픽은
     # viewer와 기록용으로만 유지하며 /center_path publisher는 하나뿐이다.
     center_path_topic: "/center_path"
+    # viewer가 실제 active CNN에 들어간 3채널 입력을 그대로 구독한다.
+    cnn_input_bev_topic: "/debug/cnn_input_bev"
     route_intent_topic: "/route_intent"
     route_reset_topic: "/route_intent_reset"
+    traffic_stop_topic: "/traffic_stop"
+    traffic_stop_reset_topic: "/traffic_stop_reset"
+    cone_trigger_topic: "/perception/cone_trigger"
+    cnn_mode_topic: "/cnn_mode"
+    cone_mode_topic: "/cone_mode"
     enable_center_path: true
-    # 같은 YOLO 결과 두 번 연속 LEFT일 때만 shortcut으로 latch한다.
-    # LEFT가 사라져도 자동 복귀하지 않고 명시 reset=true만 main 복귀한다.
+    # 같은 YOLO 결과 두 번 연속 LEFT일 때 shortcut을 시작하고 10초 뒤
+    # 자동으로 main에 복귀한다. 반복 DDS sample은 두 번으로 세지 않는다.
     left_confirm_frames: 2
     left_confidence: 0.25
-    # 최종 학습 checkpoint의 차량 배포 경로와 고정 SHA256이다.
-    model_path: "/home/xytron/xycar_ws/models/path_cnn.pt"
-    expected_model_sha256: "439937eb506fe0a25c8d9f225abc2f10b4de96d388099fe4b2570598a5c03a67"
+    shortcut_hold_sec: 10.0
+    overtake_hold_sec: 7.0
+    cone_hold_sec: 20.0
+    left_confirm_window_sec: 1.5
+    left_rearm_absent_frames: 3
+    # 녹화_20260820/직좌에서 정지선 부근 신호등은 화면 위로 올라가며
+    # 충분히 커졌다. 중심 y<=22%, 폭>=8%를 초기 decision zone으로 사용한다.
+    # 현장 영상에서 박스를 보며 이 두 값만 조정하면 된다.
+    signal_decision_center_y_max: 0.22
+    signal_decision_min_width: 0.08
+    # 네 모델을 시작 시 한 번 올리고 active mode 한 개만 추론한다.
+    general_model_path: "/home/xytron/xycar_ws/models/general_single_best_gpt.pt"
+    general_expected_sha256: "e90b0de551fdcdde5a5de96d754365380f49db412242535313c396a77201c1b1"
+    shortcut_model_path: "/home/xytron/xycar_ws/models/left_shortcut_single_best_gpt.pt"
+    shortcut_expected_sha256: "df965fecd187aeafe1fefc82916fda403c60459d3da0da42c7d47cd3eb85adb1"
+    overtake_model_path: "/home/xytron/xycar_ws/models/obstacle_single_best_gpt.pt"
+    overtake_expected_sha256: "23ff59b918a5af0dbbd31dfb8dcd41713b5c8554f5e38cdf8f07ed1bb37fb463"
+    cone_model_path: "/home/xytron/xycar_ws/models/cone_single_all967_final_gpt.pt"
+    cone_expected_sha256: "9250e5224a628672e40148c9a6f472a9c6cee2962b65175f0a6f92eb304c8913"
     device: "cpu"
     torch_threads: 2
     allow_unverified_legacy: false
@@ -49,23 +81,25 @@ cnn_path_node:
     lidar_self_x_abs: 0.25
     lidar_self_y_abs: 0.15
     lidar_radius_cells: 1
-    # 학습 8,391건에는 두 카메라 채널이 동시에 빈 샘플이 없다.
+    # 학습 데이터와 같은 흰선 바깥 제거 결과를 CNN 3번째 채널로 넣는다.
     min_camera_cells: 1
-    # clean LiDAR는 0 cells, obstacle 합성 학습 분포는 정확히 27~67 cells다.
-    # 중간값을 임계값에 억지로 맞추지 않고 이 범위를 벗어나면 STOP한다.
-    min_lidar_cells: 27
-    max_lidar_cells: 67
-    # 1차 CNN(라이다=0)으로 곡선 기준경로를 얻고, 그 회랑 안의 단일 소형
-    # 클러스터만 학습과 같은 3~14개의 희소 hit로 만든 뒤 장애물이 있을 때만
-    # 2차 CNN을 실행한다. 벽/복수 물체/희소 반사는 모두 fail-closed다.
-    lidar_preprocess_mode: "compact_reference"
-    lidar_fov_deg: 110.0
-    lidar_corridor_half_width_m: 0.70
-    lidar_cluster_gap_base_m: 0.12
-    lidar_cluster_gap_per_m: 0.03
-    lidar_min_cluster_points: 3
-    lidar_max_cluster_extent_m: 0.72
-    lidar_max_clusters: 1
+    model_lidar_safety_margin_m: 0.025
+    model_white_guard_m: 0.025
+    # OVERTAKE trigger 계약: 양쪽 흰선에서 10 cm 안쪽이며, 차량 앞
+    # 1.2 m 선 이내인 raw LiDAR cluster만 인정한다.
+    overtake_inward_margin_m: 0.10
+    overtake_white_guard_m: 0.05
+    overtake_x_min_m: 0.0
+    overtake_x_max_m: 1.20
+    overtake_min_raw_points: 3
+    overtake_min_inside_ratio: 0.50
+    overtake_min_road_width_m: 0.35
+    overtake_max_road_width_m: 1.50
+    overtake_cluster_gap_base_m: 0.15
+    overtake_cluster_gap_per_m: 0.03
+    overtake_max_cluster_extent_m: 0.90
+    overtake_confirm_frames: 2
+    overtake_rearm_clear_frames: 5
     # BEV header는 카메라 callback 도착시각이다. 실차 flash 측정 전에는 0으로 둔다.
     camera_to_scan_offset_sec: 0.0
     sync_slop_sec: 0.18
@@ -88,6 +122,7 @@ cnn_drive_gate_node:
     drive_cmd_topic: "/drive_cmd"
     manual_go_topic: "/manual_go"
     emergency_stop_topic: "/emergency_stop"
+    traffic_stop_topic: "/traffic_stop"
     control_hz: 20.0
     path_stale_sec: 1.0
     path_future_tolerance_sec: 0.05
@@ -103,8 +138,14 @@ live_pipeline_viewer_node:
   ros__parameters:
     image_topic: "/image_raw"
     bev_topic: "/perception/bev"
-    scan_topic: "/scan"
+    cnn_input_bev_topic: "/debug/cnn_input_bev"
     signal_topic: "/perception/signals"
+    cone_trigger_topic: "/perception/cone_trigger"
+    cone_mode_topic: "/cone_mode"
+    cnn_mode_topic: "/cnn_mode"
+    traffic_stop_topic: "/traffic_stop"
+    signal_decision_center_y_max: 0.22
+    signal_decision_min_width: 0.08
     motion_topic: "/debug/xycar_motor_dryrun"
     compressed_topic: "/debug/pipeline_view/compressed"
     render_hz: 8.0
@@ -117,11 +158,5 @@ live_pipeline_viewer_node:
     speed_visual_max: 10.0
     window_name: "Xycar CNN live dry-run"
     screenshot_dir: "/home/xytron/pipeline_view_shots_gpt"
-    # cnn_path_node와 동일한 LiDAR 변환값. viewer는 제어에 사용하지 않고
-    # raw scan이 어디에 찍히는지만 붉은 점으로 표시한다.
-    lidar_range_scale: 1.1476
-    lidar_min_range: 0.05
-    lidar_max_range: 8.0
-    lidar_self_x_abs: 0.25
-    lidar_self_y_abs: 0.15
-    lidar_radius_cells: 1
+    # Viewer는 /scan을 다시 계산하지 않는다. /debug/cnn_input_bev의
+    # 세 번째 채널, 즉 active CNN이 실제 본 LiDAR만 붉은 점으로 표시한다.

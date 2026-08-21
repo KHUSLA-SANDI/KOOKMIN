@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Minimal low-speed path follower for the CNN ``/center_path``.
 
-Only three control values shape steering: a fixed lookahead, one steering
-gain, and one exponential smoothing factor.  Mission-specific simulation
+Each GENERAL/SHORTCUT/OVERTAKE/CONE profile contains a fixed lookahead, one steering gain, one
+exponential smoothing factor, and its requested speed.  Mission-specific simulation
 logic (straight/curve switching, S-zone focus, boosts, preview speed, block
 steering, and re-anchoring) is deliberately absent.
 
@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from .cnn_modes import MODE_CONE, MODE_GENERAL, MODE_OVERTAKE, MODE_SHORTCUT, MODES
 from .motion_path_adapter import (
     prepare_ego_relative_path,
     stamp_to_ns,
@@ -123,9 +124,38 @@ if rclpy is not None:
             p = self._parameter
 
             self._control_hz = float(p("control_hz", 20.0))
-            self._lookahead_m = float(p("lookahead_m", 1.0))
-            self._steer_gain = float(p("steer_gain", 0.45))
-            self._steer_alpha = float(p("steer_smooth_alpha", 0.40))
+            general = {
+                "lookahead_m": float(p("lookahead_m", 1.0)),
+                "steer_gain": float(p("steer_gain", 0.45)),
+                "steer_smooth_alpha": float(p("steer_smooth_alpha", 0.40)),
+                "speed_cmd": float(p("speed_cmd", 5.0)),
+            }
+            self._profiles = {
+                MODE_GENERAL: general,
+                MODE_SHORTCUT: {
+                    "lookahead_m": float(p("shortcut_lookahead_m", general["lookahead_m"])),
+                    "steer_gain": float(p("shortcut_steer_gain", general["steer_gain"])),
+                    "steer_smooth_alpha": float(
+                        p("shortcut_steer_smooth_alpha", general["steer_smooth_alpha"])
+                    ),
+                    "speed_cmd": float(p("shortcut_speed_cmd", general["speed_cmd"])),
+                },
+                MODE_OVERTAKE: {
+                    "lookahead_m": float(p("overtake_lookahead_m", general["lookahead_m"])),
+                    "steer_gain": float(p("overtake_steer_gain", general["steer_gain"])),
+                    "steer_smooth_alpha": float(
+                        p("overtake_steer_smooth_alpha", general["steer_smooth_alpha"])
+                    ),
+                    "speed_cmd": float(p("overtake_speed_cmd", general["speed_cmd"])),
+                },
+                MODE_CONE: {
+                    "lookahead_m": float(p("cone_lookahead_m", 0.8)),
+                    "steer_gain": float(p("cone_steer_gain", 0.55)),
+                    "steer_smooth_alpha": float(p("cone_steer_smooth_alpha", 0.35)),
+                    "speed_cmd": float(p("cone_speed_cmd", 3.5)),
+                },
+            }
+            self._cnn_mode_topic = str(p("cnn_mode_topic", "/cnn_mode"))
             self._path_stale_sec = float(p("path_stale_sec", 0.25))
             self._future_tolerance_sec = float(
                 p("path_future_tolerance_sec", 0.05)
@@ -141,12 +171,21 @@ if rclpy is not None:
 
             if not math.isfinite(self._control_hz) or self._control_hz <= 0.0:
                 raise ValueError("control_hz must be positive and finite")
-            if not 0.3 <= self._lookahead_m <= 3.0:
-                raise ValueError("lookahead_m must be within the CNN 0.3..3.0 m horizon")
-            if not math.isfinite(self._steer_gain) or self._steer_gain <= 0.0:
-                raise ValueError("steer_gain must be positive and finite")
-            if not 0.0 < self._steer_alpha <= 1.0:
-                raise ValueError("steer_smooth_alpha must be within (0, 1]")
+            for mode, profile in self._profiles.items():
+                lookahead = profile["lookahead_m"]
+                if not 0.3 <= lookahead <= 3.0:
+                    raise ValueError(
+                        f"{mode} lookahead_m must be within the CNN 0.3..3.0 m horizon"
+                    )
+                gain = profile["steer_gain"]
+                if not math.isfinite(gain) or gain <= 0.0:
+                    raise ValueError(f"{mode} steer_gain must be positive and finite")
+                alpha = profile["steer_smooth_alpha"]
+                if not 0.0 < alpha <= 1.0:
+                    raise ValueError(f"{mode} steer_smooth_alpha must be within (0, 1]")
+                speed = profile["speed_cmd"]
+                if not math.isfinite(speed) or speed <= 0.0:
+                    raise ValueError(f"{mode} speed_cmd must be positive and finite")
             if self._path_stale_sec <= 0.0 or self._future_tolerance_sec < 0.0:
                 raise ValueError("path timestamp policy is invalid")
 
@@ -161,6 +200,7 @@ if rclpy is not None:
             self._cmd = dc.decode_drive_cmd([])
             self._cmd_receive_ns = -1
             self._angle_cmd = 0.0
+            self._cnn_mode = MODE_GENERAL
             self._debug: dict[str, Any] = {
                 "drive": False,
                 "reason": "startup",
@@ -170,6 +210,9 @@ if rclpy is not None:
             self.create_subscription(
                 Float32MultiArray, "/drive_cmd", self._on_drive_cmd, 10
             )
+            self.create_subscription(
+                String, self._cnn_mode_topic, self._on_cnn_mode, 10
+            )
             self._motor_pub = self.create_publisher(
                 Float32MultiArray, "/xycar_motor", 10
             )
@@ -178,11 +221,12 @@ if rclpy is not None:
             )
             self.create_timer(1.0 / self._control_hz, self._tick)
             self.create_timer(1.0 / DEBUG_HZ, self._tick_debug)
-            self.get_logger().info(
-                "simple motion ready: "
-                f"lookahead={self._lookahead_m:.2f}m "
-                f"gain={self._steer_gain:.3f} alpha={self._steer_alpha:.2f}"
+            summary = " ".join(
+                f"{mode}=({profile['lookahead_m']:.2f}m,{profile['steer_gain']:.3f},"
+                f"{profile['steer_smooth_alpha']:.2f},speed={profile['speed_cmd']:.1f})"
+                for mode, profile in self._profiles.items()
             )
+            self.get_logger().info(f"simple motion ready: {summary}")
 
         def _parameter(self, name: str, default: Any) -> Any:
             self.declare_parameter(name, default)
@@ -251,6 +295,18 @@ if rclpy is not None:
             self._cmd = dc.decode_drive_cmd(message.data)
             self._cmd_receive_ns = self.get_clock().now().nanoseconds
 
+        def _on_cnn_mode(self, message: String) -> None:
+            requested = str(message.data).strip().upper()
+            if requested not in MODES:
+                self.get_logger().warning(
+                    f"ignoring unsupported CNN motion mode: {message.data!r}",
+                    throttle_duration_sec=1.0,
+                )
+                return
+            if requested != self._cnn_mode:
+                self._cnn_mode = requested
+                self.get_logger().info(f"simple motion profile: {self._cnn_mode}")
+
         def _fresh_path(self, now_ns: int) -> bool:
             if self._path_x is None or self._path_y is None:
                 return False
@@ -272,6 +328,13 @@ if rclpy is not None:
             speed_cap_ok = math.isfinite(speed_cap) and speed_cap > 0.0
             drive = path_fresh and cmd_fresh and cmd_valid and owner_lane and speed_cap_ok
 
+            profile = self._cnn_mode
+            active = self._profiles[profile]
+            lookahead_m = active["lookahead_m"]
+            steer_gain = active["steer_gain"]
+            steer_alpha = active["steer_smooth_alpha"]
+            requested_speed = active["speed_cmd"]
+
             raw_angle = self._angle_cmd
             target_x = None
             target_y = None
@@ -281,13 +344,15 @@ if rclpy is not None:
                     raw_angle, target_x, target_y = simple_steering_command(
                         self._path_x,
                         self._path_y,
-                        lookahead_m=self._lookahead_m,
-                        steer_gain=self._steer_gain,
+                        lookahead_m=lookahead_m,
+                        steer_gain=steer_gain,
                     )
                     self._angle_cmd = smooth_steering(
-                        self._angle_cmd, raw_angle, self._steer_alpha
+                        self._angle_cmd, raw_angle, steer_alpha
                     )
-                    speed_cmd = speed_cap
+                    # /drive_cmd remains the global ceiling and STOP watchdog;
+                    # the active motion profile owns the requested speed.
+                    speed_cmd = min(speed_cap, requested_speed)
                 except ValueError as exc:
                     drive = False
                     speed_cmd = 0.0
@@ -315,17 +380,21 @@ if rclpy is not None:
 
             self._debug = {
                 "controller": "simple_motion_v1_gpt",
+                "profile": profile,
                 "drive": drive,
                 "reason": reason,
                 "path_fresh": path_fresh,
                 "cmd_fresh": cmd_fresh,
-                "lookahead_m": self._lookahead_m,
+                "lookahead_m": lookahead_m,
+                "steer_gain": steer_gain,
+                "steer_smooth_alpha": steer_alpha,
                 "target_x": target_x,
                 "target_y": target_y,
                 "raw_angle": raw_angle,
                 "angle_cmd": self._angle_cmd,
                 "angle_out": angle_out,
                 "speed_cap": speed_cap,
+                "requested_speed": requested_speed,
                 "speed_out": speed_out,
             }
 
