@@ -241,9 +241,12 @@ def test_rectangular_openvino_and_direct_signal_selection_are_configured():
         "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59"
     )
     assert yolo["classifier_model_path"].endswith(
-        "/traffic_light_cls_best_openvino_model"
+        "/yolo11s_cls_best_v2_openvino_model"
     )
-    assert yolo["classifier_imgsz"] == [224, 224]
+    assert yolo["classifier_expected_model_sha256"] == (
+        "87ac68859af279e6d153334b7c90fb27b3ed221481bda2fc68e11c7bfeab16e0"
+    )
+    assert yolo["classifier_imgsz"] == [320, 320]
     assert yolo["traffic_light_class_name"] == "traffic_light"
     assert yolo["signal_topic"] == "/perception/signals"
     assert yolo["yolo_state_topic"] == "/debug/yolo_state"

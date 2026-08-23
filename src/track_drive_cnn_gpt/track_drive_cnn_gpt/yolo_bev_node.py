@@ -53,7 +53,7 @@ DETECTOR_SOURCE_SHA256 = (
     "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59"
 )
 CLASSIFIER_SOURCE_SHA256 = (
-    "5bb0e96f38977a98d7a7d336a8d4a0b40cb91f3a0c58b03ce947c84b163b1287"
+    "87ac68859af279e6d153334b7c90fb27b3ed221481bda2fc68e11c7bfeab16e0"
 )
 
 
@@ -297,12 +297,12 @@ class YoloBevNode(Node):
         )
         self.declare_parameter(
             "classifier_model_path",
-            "/home/xytron/xycar_ws/models/traffic_light_cls_best_openvino_model",
+            "/home/xytron/xycar_ws/models/yolo11s_cls_best_v2_openvino_model",
         )
         self.declare_parameter(
             "classifier_expected_model_sha256", CLASSIFIER_SOURCE_SHA256
         )
-        self.declare_parameter("classifier_imgsz", [224, 224])
+        self.declare_parameter("classifier_imgsz", [320, 320])
         self.declare_parameter("traffic_light_class_name", "traffic_light")
         self.declare_parameter("traffic_light_conf", 0.25)
         self.declare_parameter("traffic_light_crop_padding", 0.12)
