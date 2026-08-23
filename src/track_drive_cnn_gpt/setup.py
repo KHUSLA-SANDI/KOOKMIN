@@ -33,6 +33,7 @@ setup(
             "cnn_drive_gate = track_drive_cnn_gpt.drive_gate_node:main",
             "cnn_motion = track_drive_cnn_gpt.motion_cnn_node:main",
             "simple_motion = track_drive_cnn_gpt.simple_motion_node:main",
+            "overtake_block_tuner = track_drive_cnn_gpt.overtake_block_tuner_node:main",
             "live_pipeline_viewer = track_drive_cnn_gpt.live_pipeline_viewer_node:main",
             "replay_images = track_drive_cnn_gpt.replay_source_node:main_images",
             "replay_clean_scan = track_drive_cnn_gpt.replay_source_node:main_clean_scan",

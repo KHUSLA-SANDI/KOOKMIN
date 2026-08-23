@@ -57,6 +57,10 @@ def generate_launch_description():
             "image_width": 1920,
             "image_height": 1080,
             "framerate": 30.0,
+            # Production consumes raw /image_raw only.  Do not load JPEG,
+            # Theora or compressedDepth publishers even if an accidental
+            # all-topics bridge asks for every advertised transport.
+            "image_raw.enable_pub_plugins": ["image_transport/raw"],
         }],
     )
 

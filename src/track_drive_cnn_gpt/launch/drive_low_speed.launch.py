@@ -36,6 +36,9 @@ def generate_launch_description():
     enable_drive_gate = LaunchConfiguration("enable_drive_gate")
     enable_drive = LaunchConfiguration("enable_drive")
     speed_cap = LaunchConfiguration("speed_cap")
+    enable_viewer = LaunchConfiguration("enable_viewer")
+    viewer_show_window = LaunchConfiguration("viewer_show_window")
+    viewer_publish_compressed = LaunchConfiguration("viewer_publish_compressed")
     ros_domain_id = LaunchConfiguration("ros_domain_id")
 
     return LaunchDescription([
@@ -49,7 +52,14 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_drive", default_value="false"),
         # Actual NORMAL/CONE speeds live in simple_motion.yaml.  This launch
         # value is only a global upper bound carried by /drive_cmd.
-        DeclareLaunchArgument("speed_cap", default_value="10.0"),
+        DeclareLaunchArgument("speed_cap", default_value="50.0"),
+        # Viewer is an optional read-only diagnostic consumer.  Keeping the
+        # process absent (not merely hiding its window) removes all render cost.
+        DeclareLaunchArgument("enable_viewer", default_value="false"),
+        DeclareLaunchArgument("viewer_show_window", default_value="true"),
+        DeclareLaunchArgument(
+            "viewer_publish_compressed", default_value="false"
+        ),
         DeclareLaunchArgument("ros_domain_id", default_value="7"),
         SetEnvironmentVariable(
             "FASTRTPS_DEFAULT_PROFILES_FILE", dds_profile
@@ -113,5 +123,23 @@ def generate_launch_description():
             output="screen",
             condition=IfCondition(enable_motor),
             parameters=[motion_config, legacy_car_config],
+        ),
+        Node(
+            package="track_drive_cnn_gpt",
+            executable="live_pipeline_viewer",
+            output="screen",
+            condition=IfCondition(enable_viewer),
+            parameters=[
+                perception_config,
+                {
+                    "motion_topic": "/xycar_motor",
+                    "show_window": ParameterValue(
+                        viewer_show_window, value_type=bool
+                    ),
+                    "publish_compressed": ParameterValue(
+                        viewer_publish_compressed, value_type=bool
+                    ),
+                },
+            ],
         ),
     ])

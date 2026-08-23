@@ -6,19 +6,71 @@ import pytest
 from track_drive_cnn_gpt.signal_mission import (
     ROUTE_MAIN,
     ROUTE_SHORTCUT,
+    RACE_FINISHED,
+    RACE_RUNNING,
+    RACE_WAIT_GREEN,
+    RaceLapController,
     RouteIntentLatch,
     SequencedRouteIntentLatch,
     TimedTriggerLatch,
     TrafficMissionController,
+    classifier_detections_from_traffic_light,
+    crop_normalized_detection,
     decode_signal_payload,
     decode_signal_payload_full,
     encode_signal_payload,
+    extract_classifier_probabilities,
     extract_signal_confidences,
     extract_signal_detections,
     optional_class_id,
     select_route_value,
     signal_class_ids,
 )
+
+
+def test_classifier_probabilities_and_detector_geometry_share_one_box():
+    ids = {"GREEN": 0, "LEFT": 1, "RED": 2, "YELLOW": 3}
+    result = SimpleNamespace(
+        probs=SimpleNamespace(data=np.asarray([0.05, 0.10, 0.80, 0.05]))
+    )
+    signals = extract_classifier_probabilities(result, ids)
+    traffic_box = {
+        "confidence": 0.91,
+        "x1_norm": 0.20,
+        "y1_norm": 0.10,
+        "x2_norm": 0.50,
+        "y2_norm": 0.30,
+        "center_x_norm": 0.35,
+        "center_y_norm": 0.20,
+        "width_norm": 0.30,
+        "height_norm": 0.20,
+    }
+    detections = classifier_detections_from_traffic_light(signals, traffic_box)
+
+    assert signals == pytest.approx(
+        {"GREEN": 0.05, "LEFT": 0.10, "RED": 0.80, "YELLOW": 0.05}
+    )
+    assert set(detections) == set(ids)
+    assert detections["RED"]["confidence"] == pytest.approx(0.80)
+    assert detections["RED"]["center_y_norm"] == pytest.approx(0.20)
+    assert detections["GREEN"]["width_norm"] == pytest.approx(0.30)
+
+
+def test_traffic_crop_padding_clamps_to_source_edges():
+    image = np.zeros((100, 200, 3), np.uint8)
+    crop, bounds = crop_normalized_detection(
+        image,
+        {
+            "x1_norm": 0.00,
+            "y1_norm": 0.10,
+            "x2_norm": 0.20,
+            "y2_norm": 0.30,
+        },
+        padding_ratio=0.25,
+        min_size_px=8,
+    )
+    assert bounds == (0, 5, 50, 35)
+    assert crop.shape == (30, 50, 3)
 
 
 def test_signal_class_ids_accept_the_single_v3_model_with_start_r():
@@ -221,6 +273,27 @@ def test_left_selects_shortcut_for_ten_seconds_without_refreshing_each_frame():
     assert mission.route_intent(110.11) == ROUTE_MAIN
 
 
+def test_far_left_waits_until_the_stop_line_decision_zone():
+    mission = TrafficMissionController(
+        confirm_frames=2, confidence=0.25, shortcut_hold_sec=10.0
+    )
+    far_left = {"LEFT": _box(center_y=0.30, width=0.05)}
+    first = mission.observe(1, {"LEFT": 0.9}, far_left, now_sec=1.0)
+    second = mission.observe(2, {"LEFT": 0.9}, far_left, now_sec=1.1)
+    assert first.dominant_signal == "LEFT"
+    assert not first.decision_zone
+    assert not second.route_changed
+    assert mission.left_streak == 0
+    assert mission.route_intent(1.1) == ROUTE_MAIN
+
+    close_left = {"LEFT": _box(center_y=0.18, width=0.12)}
+    mission.observe(3, {"LEFT": 0.9}, close_left, now_sec=1.2)
+    entered = mission.observe(4, {"LEFT": 0.9}, close_left, now_sec=1.3)
+    assert entered.decision_zone
+    assert entered.route_changed
+    assert mission.route_intent(1.3) == ROUTE_SHORTCUT
+
+
 def test_left_confirmation_allows_one_short_gap_inside_time_window():
     mission = TrafficMissionController(
         confirm_frames=2,
@@ -234,25 +307,33 @@ def test_left_confirmation_allows_one_short_gap_inside_time_window():
     assert mission.route_intent(2.0) == ROUTE_SHORTCUT
 
 
-def test_red_yellow_only_stop_in_position_and_green_releases():
+@pytest.mark.parametrize("stop_name", ["RED", "YELLOW"])
+def test_red_yellow_only_stop_in_position_and_near_green_releases(stop_name):
     mission = TrafficMissionController(confirm_frames=2)
-    far_red = {"RED": _box(center_y=0.30, width=0.04)}
-    mission.observe(1, {"RED": 0.9}, far_red, now_sec=1.0)
-    mission.observe(2, {"RED": 0.9}, far_red, now_sec=1.1)
+    far_stop = {stop_name: _box(center_y=0.30, width=0.04)}
+    mission.observe(1, {stop_name: 0.9}, far_stop, now_sec=1.0)
+    mission.observe(2, {stop_name: 0.9}, far_stop, now_sec=1.1)
     assert not mission.traffic_stop
 
-    close_red = {"RED": _box(center_y=0.18, width=0.12)}
-    mission.observe(3, {"RED": 0.9}, close_red, now_sec=1.2)
-    stopped = mission.observe(4, {"RED": 0.9}, close_red, now_sec=1.3)
+    close_stop = {stop_name: _box(center_y=0.18, width=0.12)}
+    mission.observe(3, {stop_name: 0.9}, close_stop, now_sec=1.2)
+    stopped = mission.observe(4, {stop_name: 0.9}, close_stop, now_sec=1.3)
     assert stopped.stop_changed
     assert mission.traffic_stop
 
     # Loss of detection must never release an already stopped vehicle.
     mission.observe(5, {}, {}, now_sec=1.4)
     assert mission.traffic_stop
+
+    # A visible but far GREEN is also only a candidate, not a GO decision.
+    far_green = {"GREEN": _box(center_y=0.30, width=0.04)}
+    mission.observe(6, {"GREEN": 0.9}, far_green, now_sec=1.5)
+    mission.observe(7, {"GREEN": 0.9}, far_green, now_sec=1.6)
+    assert mission.traffic_stop
+
     close_green = {"GREEN": _box(center_y=0.18, width=0.12)}
-    mission.observe(6, {"GREEN": 0.9}, close_green, now_sec=1.5)
-    released = mission.observe(7, {"GREEN": 0.9}, close_green, now_sec=1.6)
+    mission.observe(8, {"GREEN": 0.9}, close_green, now_sec=1.7)
+    released = mission.observe(9, {"GREEN": 0.9}, close_green, now_sec=1.8)
     assert released.stop_changed
     assert not mission.traffic_stop
 
@@ -278,7 +359,7 @@ def test_timed_trigger_confirms_entry_and_holds_exit_for_one_second():
 
 def test_confirmed_green_at_decision_line_forces_main_and_go():
     mission = TrafficMissionController(confirm_frames=2, shortcut_hold_sec=10.0)
-    left = {"LEFT": _box(center_y=0.30, width=0.05)}
+    left = {"LEFT": _box(center_y=0.18, width=0.12)}
     mission.observe(1, {"LEFT": 0.9}, left, now_sec=1.0)
     mission.observe(2, {"LEFT": 0.9}, left, now_sec=1.1)
     assert mission.route_intent(1.2) == ROUTE_SHORTCUT
@@ -289,3 +370,158 @@ def test_confirmed_green_at_decision_line_forces_main_and_go():
     assert update.route_changed
     assert mission.route_intent(1.4) == ROUTE_MAIN
     assert not mission.traffic_stop
+
+
+def _race_controller(*, finish_enabled=True):
+    return RaceLapController(
+        confirm_frames=2,
+        confidence=0.25,
+        decision_center_y_max=0.22,
+        decision_min_width=0.08,
+        target_laps=3,
+        cooldown_sec=10.0,
+        clear_frames=3,
+        finish_enabled=finish_enabled,
+    )
+
+
+def _observe_race(controller, sequence, now_sec, signal=None, in_zone=False):
+    signals = {} if signal is None else {signal: 0.9}
+    detections = (
+        {signal or "traffic_light": _box(center_y=0.18, width=0.12)}
+        if in_zone
+        else {}
+    )
+    return controller.observe(
+        sequence,
+        signals,
+        detections,
+        now_sec=now_sec,
+    )
+
+
+def _clear_race_zone(controller, sequence, now_sec):
+    update = None
+    for offset in range(3):
+        update = _observe_race(
+            controller,
+            sequence + offset,
+            now_sec + offset * 0.1,
+        )
+    return update
+
+
+def _confirm_race_encounter(controller, sequence, now_sec, signal="RED"):
+    _observe_race(controller, sequence, now_sec, signal, True)
+    return _observe_race(controller, sequence + 1, now_sec + 0.1, signal, True)
+
+
+def test_race_starts_on_two_consecutive_green_frames_without_box_geometry():
+    race = _race_controller()
+    assert race.state_name == RACE_WAIT_GREEN
+
+    far = {"GREEN": _box(center_y=0.30, width=0.04)}
+    first = race.observe(1, {"GREEN": 0.9}, far, now_sec=1.0)
+    assert not first.traffic_zone
+    assert first.green_confirm_count == 1
+    started = race.observe(2, {"GREEN": 0.9}, far, now_sec=1.1)
+    assert not started.traffic_zone
+    assert started.start_changed
+    assert started.race_started
+    assert started.race_go
+    assert started.lap_count == 0
+    assert started.state_name == RACE_RUNNING
+    assert not started.encounter_armed
+
+
+def test_race_requires_clear_rearm_cooldown_and_two_generic_zone_frames():
+    race = _race_controller()
+    _observe_race(race, 1, 0.0, "GREEN", True)
+    _observe_race(race, 2, 0.1, "GREEN", True)
+
+    # Remaining in the starting zone, including a class change, never counts.
+    for sequence in range(3, 8):
+        update = _observe_race(race, sequence, float(sequence), "RED", True)
+    assert update.lap_count == 0
+
+    # Two OUT frames are insufficient; the third rearms the next encounter.
+    _observe_race(race, 8, 8.0)
+    still_disarmed = _observe_race(race, 9, 8.1)
+    assert not still_disarmed.encounter_armed
+    rearmed = _observe_race(race, 10, 8.2)
+    assert rearmed.encounter_armed
+
+    # IN evidence before ten seconds does not leak into the confirmation.
+    too_early = _observe_race(race, 11, 9.9, "YELLOW", True)
+    assert too_early.zone_confirm_count == 0
+    # Lap counting is detector-geometry based; classification may be absent.
+    first = _observe_race(race, 12, 10.2, None, True)
+    assert first.zone_confirm_count == 1
+    lap_one = _observe_race(race, 13, 10.3, None, True)
+    assert lap_one.lap_changed
+    assert lap_one.lap_count == 1
+    assert not lap_one.encounter_armed
+
+
+def test_race_sequence_duplicate_and_restart_cannot_duplicate_same_encounter():
+    race = _race_controller()
+    _observe_race(race, 1, 0.0, "GREEN", True)
+    _observe_race(race, 2, 0.1, "GREEN", True)
+    _clear_race_zone(race, 3, 1.0)
+    _observe_race(race, 6, 10.2, "RED", True)
+    lap_one = _observe_race(race, 7, 10.3, "RED", True)
+    assert lap_one.lap_count == 1
+
+    duplicate = _observe_race(race, 7, 10.4, "RED", True)
+    assert not duplicate.accepted
+    assert duplicate.lap_count == 1
+
+    restarted = _observe_race(race, 0, 20.5, "RED", True)
+    assert restarted.source_restarted
+    assert restarted.lap_count == 1
+    _observe_race(race, 1, 20.6, "RED", True)
+    assert race.lap_count == 1
+
+
+def test_race_finishes_and_latches_on_third_return():
+    race = _race_controller()
+    _observe_race(race, 1, 0.0, "GREEN", True)
+    _observe_race(race, 2, 0.1, "GREEN", True)
+    sequence = 3
+    now = 1.0
+    for expected_lap in range(1, 4):
+        _clear_race_zone(race, sequence, now)
+        sequence += 3
+        now += 10.0
+        update = _confirm_race_encounter(race, sequence, now)
+        sequence += 2
+        now += 0.2
+        assert update.lap_count == expected_lap
+
+    assert update.finish_changed
+    assert update.race_finished
+    assert not update.race_go
+    assert update.state_name == RACE_FINISHED
+    _clear_race_zone(race, sequence, now)
+    later = _confirm_race_encounter(race, sequence + 3, now + 20.0, "GREEN")
+    assert later.race_finished
+    assert later.lap_count == 3
+
+
+def test_race_finish_disabled_keeps_running_and_counting_past_target():
+    race = _race_controller(finish_enabled=False)
+    _observe_race(race, 1, 0.0, "GREEN", True)
+    _observe_race(race, 2, 0.1, "GREEN", True)
+    sequence = 3
+    now = 1.0
+    for expected_lap in range(1, 5):
+        _clear_race_zone(race, sequence, now)
+        sequence += 3
+        now += 10.0
+        update = _confirm_race_encounter(race, sequence, now)
+        sequence += 2
+        now += 0.2
+        assert update.lap_count == expected_lap
+        assert not update.race_finished
+        assert update.race_go
+        assert update.state_name == RACE_RUNNING

@@ -30,8 +30,9 @@ def test_preview_labels_signal_and_start_r_with_source_pixel_coordinates(monkeyp
     preview = make_signal_preview(
         image,
         result,
-        {"GREEN": 0, "LEFT": 1, "RED": 2, "YELLOW": 4},
+        2,
         {"RED": 0.91},
+        traffic_detection={"confidence": 0.91},
         cone_trigger_id=3,
         cone_detection={"confidence": 0.88},
         sequence=17,
@@ -41,7 +42,7 @@ def test_preview_labels_signal_and_start_r_with_source_pixel_coordinates(monkeyp
 
     assert preview.shape == (540, 960, 3)
     assert any(
-        "RED 0.91 C(200,300) B(100,200,300,400)" in text
+        "traffic_light 0.91 C(200,300) B(100,200,300,400)" in text
         for text in captured_text
     )
     assert any(
@@ -67,8 +68,9 @@ def test_preview_lists_all_target_classes_when_nothing_is_detected(monkeypatch):
     make_signal_preview(
         image,
         result,
-        {"GREEN": 0, "LEFT": 1, "RED": 2, "YELLOW": 4},
+        2,
         {},
+        traffic_detection=None,
         cone_trigger_id=3,
         cone_detection=None,
         sequence=18,

@@ -4,7 +4,7 @@ The model channel and the trigger deliberately use two different masks:
 
 * model input follows the training-time outside-white removal policy;
 * OVERTAKE evidence must be at least 10 cm inside both white boundaries and
-  in the 0 < x <= 1.2 m forward window.
+  in the 0 < x <= 1.4 m forward window.
 """
 
 from __future__ import annotations
@@ -198,7 +198,7 @@ def filter_and_detect_in_road(
     trigger_inward_margin_m: float = 0.10,
     trigger_white_guard_m: float = 0.05,
     trigger_x_min_m: float = 0.0,
-    trigger_x_max_m: float = 1.20,
+    trigger_x_max_m: float = 1.40,
     trigger_min_points: int = 3,
     trigger_min_inside_ratio: float = 0.50,
     trigger_min_road_width_m: float = 0.35,

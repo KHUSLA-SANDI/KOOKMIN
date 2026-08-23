@@ -15,7 +15,7 @@ motion_node:
     steer_limit_left: -62.593314622
     steer_limit_right: 58.592366078
     slew_angle_per_tick: 8.0   # 20Hz 틱당 조향 출력 변화 상한
-    slew_speed_per_tick: 1.5   # 틱당 속도 변화 상한 — 센서리스 ESC 정지→고속 직행 불가(램프 필수)
+    slew_speed_per_tick: 0.25  # 실차 측정: 20Hz에서 0->12 약 2.4초 (12.62A, 8.3V)
     speed_deadzone: 4.0        # 명령 4 미만은 안 구름 (실측)
     allow_reverse: false       # 자율주행 경로는 후진 금지
     cmd_to_ms: 0.08            # speed 명령 ×0.08 = m/s (실측검증; eRPM = 4614×m/s)
@@ -31,7 +31,7 @@ teleop_node:
     steer_limit_left: -62.593314622
     steer_limit_right: 58.592366078
     slew_angle_per_tick: 8.0
-    slew_speed_per_tick: 1.5   # 센서리스 기동 램프
+    slew_speed_per_tick: 0.25  # 자율주행과 같은 실차 기동 램프
     speed_deadzone: 4.0        # (실측)
     allow_reverse: true        # 텔레옵만 후진 허용
     cmd_to_ms: 0.08            # (실측검증)

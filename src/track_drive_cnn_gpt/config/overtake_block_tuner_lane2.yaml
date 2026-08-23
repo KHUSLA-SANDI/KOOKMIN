@@ -1,0 +1,28 @@
+motion_node:
+  ros__parameters:
+    # 2차선(오른쪽) 이동 블록.
+    # 실행 순서: 2초 대기 -> 직진으로 speed_cmd 도달 -> 우회전 -> 좌회전
+    #            -> 직진 -> 정지 -> 자동 종료.
+    control_hz: 20.0
+    start_delay_sec: 2.0
+    motor_topic: "/xycar_motor"
+    move_direction: "RIGHT"
+
+    # 논리 조향 부호: 좌회전 음수(-), 우회전 양수(+).
+    # [실차 메모 / speed_cmd=20]
+    # 나쁘지 않았던 2차선 후보: 우 +60 x 6틱 -> 좌 -60 x 10틱
+    #                           -> 직진 20틱. 현재 적용값도 이 후보다.
+    left_angle_cmd: -60.0
+    left_ticks: 10
+    right_angle_cmd: 60.0
+    right_ticks: 6
+
+    straight_ticks: 20
+
+    # 이 속도까지 직진 가속한 뒤 전체 블록에서 계속 유지한다.
+    speed_cmd: 20.0
+
+    startup_speed_cmd: 5.0
+    startup_hold_sec: 1.0
+    slew_speed_up_per_tick: 0.75
+    slew_speed_down_per_tick: 2.0

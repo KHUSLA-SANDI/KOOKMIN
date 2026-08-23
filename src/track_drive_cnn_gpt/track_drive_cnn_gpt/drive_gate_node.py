@@ -1,9 +1,13 @@
 """Parallel STOP/GO gate for a CNN path that goes directly to motion.
 
 This node never selects or republishes a path.  ``cnn_path_node`` is the only
-publisher of ``/center_path``; this gate merely monitors that selected path,
-manual arming, and emergency stop, then refreshes the legacy ``/drive_cmd``
-watchdog at 20 Hz.
+publisher of ``/center_path``.  Path messages are observed for diagnostics but
+are deliberately *not* a GO/STOP condition: a transient perception dropout
+must not interrupt propulsion.  Race/manual arming, traffic/emergency stop,
+and the launch-level drive enable remain the gate conditions, and the legacy
+``/drive_cmd`` watchdog is refreshed at 20 Hz.  Normal race arming comes from
+the confirmed GREEN lifecycle on ``/race_go``; ``/manual_go`` remains an
+explicit operator override in either direction.
 """
 
 from __future__ import annotations
@@ -54,20 +58,35 @@ class DriveGateDecision:
 
 
 class DriveGateLogic:
-    """ROS-independent arming, emergency-stop, and source-age gate."""
+    """ROS-independent automatic race arming and explicit-stop gate.
+
+    ``path_source_time`` is retained only as diagnostic state.  Missing, stale,
+    future, or malformed path messages never change the drive decision.
+    """
 
     def __init__(self, *, enable_drive: bool = False, path_stale_sec: float = 0.25):
         if not math.isfinite(float(path_stale_sec)) or float(path_stale_sec) <= 0.0:
             raise ValueError("path_stale_sec must be positive and finite")
         self.enable_drive = bool(enable_drive)
         self.path_stale_sec = float(path_stale_sec)
+        # ``None`` means automatic race arming owns START/WAIT.  Once an
+        # operator publishes /manual_go, that explicit True/False overrides
+        # the automatic value until the node is restarted.  This keeps the
+        # existing field STOP/GO commands useful without requiring one for a
+        # normal race start.
         self.manual_go = False
+        self.manual_override: Optional[bool] = None
+        self.race_go = False
         self.emergency_stop = False
         self.traffic_stop = False
         self.path_source_time: Optional[float] = None
 
     def set_manual_go(self, enabled: bool) -> None:
         self.manual_go = bool(enabled)
+        self.manual_override = bool(enabled)
+
+    def set_race_go(self, enabled: bool) -> None:
+        self.race_go = bool(enabled)
 
     def set_emergency_stop(self, active: bool) -> None:
         self.emergency_stop = bool(active)
@@ -88,16 +107,13 @@ class DriveGateLogic:
             return DriveGateDecision(False, "emergency_stop")
         if self.traffic_stop:
             return DriveGateDecision(False, "traffic_signal_stop")
-        if not self.manual_go:
-            return DriveGateDecision(False, "manual_go_required")
-        if self.path_source_time is None or not math.isfinite(float(now)):
-            return DriveGateDecision(False, "selected_path_missing")
-        age = float(now) - self.path_source_time
-        if age < 0.0:
-            return DriveGateDecision(False, "selected_path_from_future")
-        if age > self.path_stale_sec:
-            return DriveGateDecision(False, "selected_path_stale")
-        return DriveGateDecision(True, "ok")
+        if self.manual_override is False:
+            return DriveGateDecision(False, "manual_stop")
+        if self.manual_override is True:
+            return DriveGateDecision(True, "ok_manual_override")
+        if not self.race_go:
+            return DriveGateDecision(False, "waiting_for_green")
+        return DriveGateDecision(True, "ok_race")
 
 
 try:
@@ -118,6 +134,7 @@ if rclpy is not None:
             self.declare_parameter("center_path_topic", "/center_path")
             self.declare_parameter("drive_cmd_topic", "/drive_cmd")
             self.declare_parameter("manual_go_topic", "/manual_go")
+            self.declare_parameter("race_go_topic", "/race_go")
             self.declare_parameter("emergency_stop_topic", "/emergency_stop")
             self.declare_parameter("traffic_stop_topic", "/traffic_stop")
             self.declare_parameter("control_hz", 20.0)
@@ -143,9 +160,10 @@ if rclpy is not None:
                 enable_drive=bool(self.get_parameter("enable_drive").value),
                 path_stale_sec=float(self.get_parameter("path_stale_sec").value),
             )
-            self._logic.set_manual_go(
-                bool(self.get_parameter("initial_manual_go").value)
-            )
+            # false means "no manual override", so automatic GREEN arming can
+            # take ownership.  true remains available for explicit dry-runs.
+            if bool(self.get_parameter("initial_manual_go").value):
+                self._logic.set_manual_go(True)
             self._last_source_ns = -1
             self._last_status = None
 
@@ -159,6 +177,12 @@ if rclpy is not None:
                 Bool,
                 str(self.get_parameter("manual_go_topic").value),
                 lambda msg: self._logic.set_manual_go(msg.data),
+                10,
+            )
+            self.create_subscription(
+                Bool,
+                str(self.get_parameter("race_go_topic").value),
+                lambda msg: self._logic.set_race_go(msg.data),
                 10,
             )
             self.create_subscription(
@@ -181,8 +205,9 @@ if rclpy is not None:
             self.create_timer(1.0 / control_hz, self._tick)
             self.get_logger().info(
                 "CNN drive gate ready: observes /center_path only; "
-                "does not select or republish paths; initial_manual_go=%s"
-                % str(self._logic.manual_go).lower()
+                "does not select or republish paths; initial_manual_go=%s "
+                "automatic GREEN arming enabled"
+                % str(self._logic.manual_override is True).lower()
             )
 
         @staticmethod
@@ -201,9 +226,8 @@ if rclpy is not None:
             return True
 
         def _invalidate(self, reason: str) -> None:
-            self._logic.update_path(None)
             self.get_logger().warning(
-                f"drive gate path invalid: {reason}",
+                f"drive gate ignoring invalid path: {reason}",
                 throttle_duration_sec=1.0,
             )
 

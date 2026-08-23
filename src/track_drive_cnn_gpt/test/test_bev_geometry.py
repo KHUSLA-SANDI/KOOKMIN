@@ -32,6 +32,7 @@ from track_drive_cnn_gpt.bev_geometry import (
     normalize_imgsz,
     optional_native_mask_hw,
     remap_optional_native_masks,
+    validate_classifier_model_contract,
     validate_model_contract,
 )
 
@@ -341,6 +342,34 @@ def _openvino_fixture(tmp_path: Path, **overrides: object) -> tuple[Path, str]:
 def test_openvino_contract_accepts_traceable_matching_export(tmp_path: Path) -> None:
     model_dir, expected = _openvino_fixture(tmp_path)
     assert validate_model_contract(model_dir, expected, (384, 640)) == "openvino"
+
+
+def test_classifier_openvino_contract_accepts_four_signal_classes(
+    tmp_path: Path,
+) -> None:
+    model_dir = tmp_path / "traffic_classifier_openvino_model"
+    model_dir.mkdir()
+    (model_dir / "model.xml").write_text("<xml/>", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"weights")
+    expected = "1" * 64
+    manifest = {
+        "schema_version": OPENVINO_MANIFEST_SCHEMA,
+        "source_sha256": expected,
+        "imgsz": [224, 224],
+        "input_shape": [1, 3, 224, 224],
+        "dynamic": False,
+        "batch": 1,
+        "precision": "FP32",
+        "task": "classify",
+        "classes": {"0": "GREEN", "1": "LEFT", "2": "RED", "3": "YELLOW"},
+    }
+    (model_dir / "export_manifest_gpt.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    assert (
+        validate_classifier_model_contract(model_dir, expected, (224, 224))
+        == "openvino"
+    )
 
 
 @pytest.mark.parametrize(

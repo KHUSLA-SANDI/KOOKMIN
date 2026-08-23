@@ -59,6 +59,7 @@ from .road_lidar_filter import filter_and_detect_in_road, reference_from_mid_gri
 from .signal_mission import (
     ROUTE_MAIN,
     ROUTE_SHORTCUT,
+    RaceLapController,
     TrafficMissionController,
     decode_signal_payload_full,
 )
@@ -115,32 +116,61 @@ class CnnPathNode(Node):
         traffic_stop_reset_topic = str(
             p("traffic_stop_reset_topic", "/traffic_stop_reset")
         )
+        race_go_topic = str(p("race_go_topic", "/race_go"))
         cone_trigger_topic = str(
             p("cone_trigger_topic", "/perception/cone_trigger")
+        )
+        start_r_detected_topic = str(
+            p("start_r_detected_topic", "/perception/start_r_detected")
         )
         self._mode_topic = str(p("cnn_mode_topic", "/cnn_mode"))
         self._cone_mode_topic = str(p("cone_mode_topic", "/cone_mode"))
         self._enable_center_path = bool(p("enable_center_path", True))
         shortcut_hold_sec = float(p("shortcut_hold_sec", 10.0))
+        overtake_hold_sec = float(p("overtake_hold_sec", 7.0))
+        cone_hold_sec = float(p("cone_hold_sec", 20.0))
+        self._mode_hold_seconds = {
+            MODE_GENERAL: 0.0,
+            MODE_SHORTCUT: shortcut_hold_sec,
+            MODE_OVERTAKE: overtake_hold_sec,
+            MODE_CONE: cone_hold_sec,
+        }
+        signal_confirm_frames = int(p("left_confirm_frames", 2))
+        signal_confidence = float(p("left_confidence", 0.25))
+        decision_center_y_max = float(
+            p("signal_decision_center_y_max", 0.22)
+        )
+        decision_min_width = float(p("signal_decision_min_width", 0.08))
         self._mission = TrafficMissionController(
-            confirm_frames=int(p("left_confirm_frames", 2)),
-            confidence=float(p("left_confidence", 0.25)),
+            confirm_frames=signal_confirm_frames,
+            confidence=signal_confidence,
             shortcut_hold_sec=shortcut_hold_sec,
             left_confirm_window_sec=float(p("left_confirm_window_sec", 1.5)),
-            decision_center_y_max=float(p("signal_decision_center_y_max", 0.22)),
-            decision_min_width=float(p("signal_decision_min_width", 0.08)),
+            decision_center_y_max=decision_center_y_max,
+            decision_min_width=decision_min_width,
             left_rearm_absent_frames=int(p("left_rearm_absent_frames", 3)),
+        )
+        self._race = RaceLapController(
+            confirm_frames=signal_confirm_frames,
+            confidence=signal_confidence,
+            decision_center_y_max=decision_center_y_max,
+            decision_min_width=decision_min_width,
+            target_laps=int(p("race_target_laps", 3)),
+            cooldown_sec=float(p("race_lap_cooldown_sec", 10.0)),
+            clear_frames=int(p("race_lap_clear_frames", 5)),
+            finish_enabled=bool(p("race_finish_enabled", True)),
         )
         self._mode_controller = CnnModeController(
             shortcut_hold_sec=shortcut_hold_sec,
-            overtake_hold_sec=float(p("overtake_hold_sec", 7.0)),
-            cone_hold_sec=float(p("cone_hold_sec", 20.0)),
+            overtake_hold_sec=overtake_hold_sec,
+            cone_hold_sec=cone_hold_sec,
         )
         self._overtake_latch = ConfirmedOneShot(
             confirm_frames=int(p("overtake_confirm_frames", 2)),
             rearm_clear_frames=int(p("overtake_rearm_clear_frames", 5)),
         )
         self._cone_trigger_high = False
+        self._start_r_detected = False
         self._last_route_intent = ROUTE_MAIN
         self._last_published_mode = ""
         self._last_center_message: Optional[PoseArray] = None
@@ -170,13 +200,13 @@ class CnnPathNode(Node):
         )
         self._model_white_guard = float(p("model_white_guard_m", 0.025))
         # User-selected trigger contract: at least 10 cm inside both white
-        # boundaries and before the x=1.2 m forward line.
+        # boundaries and before the x=1.4 m forward line.
         self._overtake_inward_margin = float(
             p("overtake_inward_margin_m", 0.10)
         )
         self._overtake_white_guard = float(p("overtake_white_guard_m", 0.05))
         self._overtake_x_min = float(p("overtake_x_min_m", 0.0))
-        self._overtake_x_max = float(p("overtake_x_max_m", 1.20))
+        self._overtake_x_max = float(p("overtake_x_max_m", 1.40))
         self._overtake_min_points = int(p("overtake_min_raw_points", 3))
         self._overtake_min_inside_ratio = float(
             p("overtake_min_inside_ratio", 0.50)
@@ -222,9 +252,9 @@ class CnnPathNode(Node):
             raise ValueError(
                 "overtake_inward_margin_m is fixed to the approved 0.10 m contract"
             )
-        if not np.isclose(self._overtake_x_max, 1.20, rtol=0.0, atol=1e-9):
+        if not np.isclose(self._overtake_x_max, 1.40, rtol=0.0, atol=1e-9):
             raise ValueError(
-                "overtake_x_max_m is fixed to the approved 1.20 m forward line"
+                "overtake_x_max_m is fixed to the current 1.40 m forward line"
             )
 
         guard = PathGuardConfig(
@@ -274,6 +304,7 @@ class CnnPathNode(Node):
         self._center_pub = self.create_publisher(PoseArray, center_topic, 1)
         self._route_pub = self.create_publisher(String, route_intent_topic, 1)
         self._traffic_stop_pub = self.create_publisher(Bool, traffic_stop_topic, 1)
+        self._race_go_pub = self.create_publisher(Bool, race_go_topic, 1)
         self._mode_pub = self.create_publisher(String, self._mode_topic, 1)
         self._cone_mode_pub = self.create_publisher(Bool, self._cone_mode_topic, 1)
         self._diag_pub = self.create_publisher(String, "/debug/cnn_path", 10)
@@ -289,6 +320,9 @@ class CnnPathNode(Node):
         self.create_subscription(Image, self._bev_topic, self._on_bev, LATEST_QOS)
         self.create_subscription(String, signal_topic, self._on_signals, 1)
         self.create_subscription(Bool, cone_trigger_topic, self._on_cone_trigger, 1)
+        self.create_subscription(
+            Bool, start_r_detected_topic, self._on_start_r_detected, 1
+        )
         self.create_subscription(Bool, route_reset_topic, self._on_route_reset, 1)
         self.create_subscription(
             Bool,
@@ -341,8 +375,32 @@ class CnnPathNode(Node):
 
     def _publish_traffic_stop(self) -> None:
         message = Bool()
-        message.data = bool(self._mission.traffic_stop)
+        # A completed race is a terminal STOP latch.  A later GREEN or a
+        # manual traffic-stop reset may clear the signal mission, but cannot
+        # release the three-lap finish.
+        message.data = bool(self._mission.traffic_stop or self._race.finished)
         self._traffic_stop_pub.publish(message)
+
+    def _publish_race_go(self) -> None:
+        self._race_go_pub.publish(
+            Bool(data=bool(self._race.started and not self._race.finished))
+        )
+
+    def _race_diagnostics(self) -> dict:
+        now_sec = self._now_sec()
+        return {
+            "race_state": self._race.state_name,
+            "race_started": bool(self._race.started),
+            "race_finished": bool(self._race.finished),
+            "race_go": bool(self._race.started and not self._race.finished),
+            "race_lap_count": int(self._race.lap_count),
+            "race_target_laps": int(self._race.target_laps),
+            "race_finish_enabled": bool(self._race.finish_enabled),
+            "race_encounter_armed": bool(self._race.encounter_armed),
+            "race_cooldown_remaining_sec": round(
+                self._race.cooldown_remaining_sec(now_sec), 2
+            ),
+        }
 
     def _on_signals(self, message: String) -> None:
         """Update the route latch from the same YOLO pass used for BEV."""
@@ -355,11 +413,18 @@ class CnnPathNode(Node):
                 throttle_duration_sec=1.0,
             )
             return
+        now_sec = self._now_sec()
+        race_update = self._race.observe(
+            sequence,
+            signals,
+            detections,
+            now_sec=now_sec,
+        )
         update = self._mission.observe(
             sequence,
             signals,
             detections,
-            now_sec=self._now_sec(),
+            now_sec=now_sec,
         )
         if not update.accepted:
             return
@@ -369,16 +434,21 @@ class CnnPathNode(Node):
             )
         if update.route_changed:
             if update.route_intent == ROUTE_SHORTCUT:
-                mode = self._mode_controller.trigger(
-                    MODE_SHORTCUT,
-                    now_sec=self._now_sec(),
-                    reason="left_signal_confirmed",
-                )
-                self.get_logger().info(
-                    "LEFT confirmed: shortcut selected for %.1f seconds"
-                    % self._mission.shortcut_hold_sec
-                )
-                self._publish_mode(mode)
+                if self._race.started and not self._race.finished:
+                    mode = self._mode_controller.trigger(
+                        MODE_SHORTCUT,
+                        now_sec=now_sec,
+                        reason="left_signal_confirmed",
+                    )
+                    self.get_logger().info(
+                        "LEFT confirmed: shortcut selected for %.1f seconds"
+                        % self._mission.shortcut_hold_sec
+                    )
+                    self._publish_mode(mode)
+                else:
+                    self.get_logger().info(
+                        "LEFT ignored while race is not RUNNING"
+                    )
             else:
                 self.get_logger().info(
                     f"signal decision selected main: {update.dominant_signal}"
@@ -389,6 +459,19 @@ class CnnPathNode(Node):
             self.get_logger().warning(
                 f"traffic decision changed: {state} signal={update.dominant_signal}"
             )
+        if race_update.start_changed:
+            self.get_logger().warning(
+                "RACE START: initial GREEN confirmed; LAP=0"
+            )
+        if race_update.lap_changed:
+            self.get_logger().warning(
+                f"RACE LAP={race_update.lap_count}/{self._race.target_laps}"
+            )
+        if race_update.finish_changed:
+            self.get_logger().warning(
+                f"RACE FINISHED: {race_update.lap_count} laps; terminal STOP"
+            )
+        self._publish_race_go()
         self._publish_traffic_stop()
 
     def _on_cone_trigger(self, message: Bool) -> None:
@@ -403,6 +486,11 @@ class CnnPathNode(Node):
             reason="start_r_confirmed",
         )
         self._publish_mode(mode)
+
+    def _on_start_r_detected(self, message: Bool) -> None:
+        """Block OVERTAKE as soon as START_R is visible, before y2 entry."""
+
+        self._start_r_detected = bool(message.data)
 
     def _on_route_reset(self, message: Bool) -> None:
         if not message.data:
@@ -432,7 +520,12 @@ class CnnPathNode(Node):
             return
         self._mission.reset_stop()
         self._publish_traffic_stop()
-        self.get_logger().warning("traffic STOP explicitly reset")
+        if self._race.finished:
+            self.get_logger().warning(
+                "traffic STOP reset requested, but race finish STOP remains latched"
+            )
+        else:
+            self.get_logger().warning("traffic STOP explicitly reset")
 
     def _publish_center(self, path: SanitizedPath, header) -> SanitizedPath:
         published = path
@@ -539,15 +632,29 @@ class CnnPathNode(Node):
         self._main_pub.publish(path_message(empty, header))
         self._shortcut_pub.publish(path_message(empty, header))
         selected = self._publish_center(empty, header)
-        route = self._current_route()
+        mode_state = self._current_mode()
+        route = ROUTE_SHORTCUT if mode_state.mode == MODE_SHORTCUT else ROUTE_MAIN
         payload = {
             "ok": False,
             "reason": reason,
+            "cnn_mode": mode_state.mode,
+            "mode_remaining_sec": round(mode_state.remaining_sec, 2),
+            "mode_duration_sec": self._mode_hold_seconds[mode_state.mode],
+            "mode_reason": mode_state.reason,
             "route_intent": route,
             "selected_route": route,
             "selected_usable": selected.usable,
             "selected_reason": selected.reason,
-            "traffic_stop": bool(self._mission.traffic_stop),
+            "traffic_stop": bool(
+                self._mission.traffic_stop or self._race.finished
+            ),
+            "left_streak": self._mission.left_streak,
+            "cone_trigger_raw": bool(self._cone_trigger_high),
+            "start_r_detected": bool(self._start_r_detected),
+            "overtake_confirm_count": self._overtake_latch.positive_count,
+            "overtake_confirm_frames": self._overtake_latch.confirm_frames,
+            "overtake_trigger_armed": self._overtake_latch.armed,
+            **self._race_diagnostics(),
             **extra,
         }
         self._diag_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
@@ -626,6 +733,11 @@ class CnnPathNode(Node):
         road_diag = {
             "reference": reference_source,
             "trigger_detected": False,
+            "trigger_min_points": self._overtake_min_points,
+            "trigger_min_inside_ratio": self._overtake_min_inside_ratio,
+            "trigger_x_min_m": self._overtake_x_min,
+            "trigger_x_max_m": self._overtake_x_max,
+            "trigger_inward_margin_m": self._overtake_inward_margin,
         }
         raw_lidar_grid = points_to_grid(
             raw_lidar_points, radius_cells=self._lidar_radius
@@ -675,15 +787,37 @@ class CnnPathNode(Node):
                     "trigger_detected": road.trigger_detected,
                     "trigger_cluster_points": road.trigger_cluster_points,
                     "trigger_inside_points": road.trigger_inside_points,
+                    "trigger_inside_ratio": (
+                        road.trigger_inside_points
+                        / float(max(1, road.trigger_cluster_points))
+                    ),
                     "reliable_boundary_rows": road.reliable_rows,
                     "removed_outside_points": road.removed_points,
+                }
+            )
+            detected_before_start_r_suppression = bool(road.trigger_detected)
+            suppressed_by_start_r = bool(
+                detected_before_start_r_suppression and self._start_r_detected
+            )
+            effective_overtake_detected = bool(
+                detected_before_start_r_suppression and not self._start_r_detected
+            )
+            road_diag.update(
+                {
+                    "trigger_detected_before_start_r_suppression": (
+                        detected_before_start_r_suppression
+                    ),
+                    "suppressed_by_start_r": suppressed_by_start_r,
+                    "trigger_detected": effective_overtake_detected,
                 }
             )
             # Feed the real detection state even while another mode owns the
             # path.  Treating "mode is not GENERAL" as a clear frame would
             # re-arm the one-shot while the same obstacle is still present,
             # causing another 7-second window immediately after expiry.
-            overtake_event = self._overtake_latch.observe(road.trigger_detected)
+            overtake_event = self._overtake_latch.observe(
+                effective_overtake_detected
+            )
             trigger_allowed = (
                 mode_state.mode == MODE_GENERAL and not self._cone_trigger_high
             )
@@ -747,6 +881,7 @@ class CnnPathNode(Node):
             "ok": bool(published_selected.usable),
             "cnn_mode": mode_state.mode,
             "mode_remaining_sec": round(mode_state.remaining_sec, 2),
+            "mode_duration_sec": self._mode_hold_seconds[mode_state.mode],
             "mode_reason": mode_state.reason,
             "model_kind": active_model.model_kind,
             "selected_route": "shortcut" if mode_state.mode == MODE_SHORTCUT else "main",
@@ -755,14 +890,18 @@ class CnnPathNode(Node):
             "selected_points": published_selected.point_count,
             "left_streak": self._mission.left_streak,
             "last_signal_sequence": self._mission.last_sequence,
-            "traffic_stop": bool(self._mission.traffic_stop),
+            "traffic_stop": bool(
+                self._mission.traffic_stop or self._race.finished
+            ),
             "camera_cells": camera_cells,
             "lidar_preprocess_mode": lidar_preprocess,
             "road_lidar": road_diag,
             "cone_trigger_raw": bool(self._cone_trigger_high),
+            "start_r_detected": bool(self._start_r_detected),
             "overtake_confirm_count": self._overtake_latch.positive_count,
             "overtake_confirm_frames": self._overtake_latch.confirm_frames,
             "overtake_trigger_armed": self._overtake_latch.armed,
+            **self._race_diagnostics(),
             "raw_lidar_points": int(raw_lidar_points.shape[0]),
             "raw_lidar_cells": raw_lidar_cells,
             "filtered_lidar_points": lidar_points,

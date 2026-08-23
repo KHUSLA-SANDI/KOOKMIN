@@ -283,6 +283,92 @@ def validate_model_contract(
     raise FileNotFoundError(f"model_path does not exist: {model_path}")
 
 
+def validate_classifier_model_contract(
+    path: str | Path, expected_sha256: str, runtime_imgsz: Any
+) -> str:
+    """Validate the four-class traffic-light classifier or its OpenVINO export."""
+
+    model_path = Path(path).expanduser()
+    expected = str(expected_sha256).strip().lower()
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        raise ValueError(
+            "expected classifier SHA256 must be exactly 64 hexadecimal characters"
+        )
+    runtime_hw = normalize_imgsz(runtime_imgsz)
+
+    if model_path.is_file():
+        if model_path.suffix.lower() != ".pt":
+            raise ValueError(f"classifier file must be a .pt checkpoint: {model_path}")
+        actual = _sha256_file(model_path)
+        if actual != expected:
+            raise ValueError(
+                "classifier SHA256 mismatch: "
+                f"expected {expected}, got {actual} ({model_path})"
+            )
+        return "pytorch"
+
+    if model_path.is_dir():
+        if not any(model_path.glob("*.xml")) or not any(model_path.glob("*.bin")):
+            raise ValueError(
+                "OpenVINO classifier directory must contain .xml and .bin files: "
+                f"{model_path}"
+            )
+        manifest_path = model_path / "export_manifest_gpt.json"
+        if not manifest_path.is_file():
+            raise ValueError(
+                f"OpenVINO classifier export manifest is missing: {manifest_path}"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"cannot read OpenVINO classifier manifest: {manifest_path}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise ValueError("OpenVINO classifier manifest root must be an object")
+        if manifest.get("schema_version") != OPENVINO_MANIFEST_SCHEMA:
+            raise ValueError("unsupported OpenVINO classifier manifest schema_version")
+        source_sha = str(manifest.get("source_sha256", "")).strip().lower()
+        if source_sha != expected:
+            raise ValueError(
+                "OpenVINO classifier source SHA256 mismatch: "
+                f"expected {expected}, got {source_sha or '<missing>'}"
+            )
+        try:
+            exported_hw = normalize_imgsz(manifest["imgsz"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "OpenVINO classifier manifest has no valid [height, width] imgsz"
+            ) from exc
+        if exported_hw != runtime_hw:
+            raise ValueError(
+                "OpenVINO classifier imgsz mismatch: "
+                f"export={list(exported_hw)}, runtime={list(runtime_hw)}"
+            )
+        expected_input_shape = [1, 3, exported_hw[0], exported_hw[1]]
+        if manifest.get("input_shape") != expected_input_shape:
+            raise ValueError(
+                "OpenVINO classifier input_shape mismatch: "
+                f"expected {expected_input_shape}, got {manifest.get('input_shape')!r}"
+            )
+        if manifest.get("dynamic") is not False or manifest.get("batch") != 1:
+            raise ValueError("OpenVINO classifier must be static batch=1")
+        if str(manifest.get("precision", "")).upper() != "FP32":
+            raise ValueError("OpenVINO classifier must declare precision=FP32")
+        if str(manifest.get("task", "")).lower() != "classify":
+            raise ValueError("OpenVINO classifier must declare task=classify")
+        names = _manifest_class_names(manifest.get("classes"))
+        missing = {"green", "left", "red", "yellow"} - names
+        if missing:
+            raise ValueError(
+                "OpenVINO classifier is missing required classes: "
+                + ", ".join(sorted(missing))
+            )
+        return "openvino"
+
+    raise FileNotFoundError(f"classifier_model_path does not exist: {model_path}")
+
+
 def _to_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach()
@@ -606,4 +692,5 @@ __all__ = [
     "optional_native_mask_hw",
     "remap_optional_native_masks",
     "validate_model_contract",
+    "validate_classifier_model_contract",
 ]

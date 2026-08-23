@@ -16,31 +16,46 @@ def test_drive_gate_is_disabled_and_unarmed_by_default():
     assert decision.reason == "drive_disabled"
 
 
-def test_drive_gate_requires_manual_go_and_a_fresh_selected_path():
+def test_drive_gate_waits_for_green_but_not_a_selected_path():
     logic = DriveGateLogic(enable_drive=True, path_stale_sec=0.25)
-    assert logic.decide(10.0).reason == "manual_go_required"
+    assert logic.decide(10.0).reason == "waiting_for_green"
 
-    logic.set_manual_go(True)
-    assert logic.decide(10.0).reason == "selected_path_missing"
+    logic.set_race_go(True)
+    assert logic.decide(10.0).drive_allowed
 
     logic.update_path(9.90)
     decision = logic.decide(10.0)
     assert decision.drive_allowed
-    assert decision.reason == "ok"
+    assert decision.reason == "ok_race"
 
 
-def test_drive_gate_rejects_stale_future_and_invalidated_paths():
+def test_manual_command_overrides_automatic_race_arming_both_ways():
+    logic = DriveGateLogic(enable_drive=True, path_stale_sec=0.25)
+    logic.set_race_go(True)
+    assert logic.decide(10.0).drive_allowed
+
+    logic.set_manual_go(False)
+    assert logic.decide(10.0).reason == "manual_stop"
+
+    logic.set_manual_go(True)
+    logic.set_race_go(False)
+    decision = logic.decide(10.0)
+    assert decision.drive_allowed
+    assert decision.reason == "ok_manual_override"
+
+
+def test_drive_gate_ignores_stale_future_and_invalidated_paths():
     logic = DriveGateLogic(enable_drive=True, path_stale_sec=0.25)
     logic.set_manual_go(True)
 
     logic.update_path(9.70)
-    assert logic.decide(10.0).reason == "selected_path_stale"
+    assert logic.decide(10.0).drive_allowed
 
     logic.update_path(10.01)
-    assert logic.decide(10.0).reason == "selected_path_from_future"
+    assert logic.decide(10.0).drive_allowed
 
     logic.update_path(None)
-    assert logic.decide(10.0).reason == "selected_path_missing"
+    assert logic.decide(10.0).drive_allowed
 
 
 def test_emergency_stop_has_priority_over_manual_go_and_path():

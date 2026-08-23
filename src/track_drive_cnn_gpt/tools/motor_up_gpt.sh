@@ -6,8 +6,46 @@ source /home/xytron/env.sh
 export ROS_MASTER_URI=http://localhost:11311
 source /home/xytron/ros-humble-ros1-bridge/install/local_setup.bash
 
-if pgrep -f 'ros1_bridge dynamic_bridge' >/dev/null 2>&1; then
-    echo "[motor] dynamic_bridge가 이미 실행 중입니다. 기존 창을 사용하세요."
+# 대회 제공 motor 실행기는 --bridge-all-topics 브리지를 먼저 띄운다.
+# 그 상태를 정상 브리지로 오인하면 1080p 카메라와 모든 image_transport
+# 변종이 ROS1로 넘어가 CPU를 고갈시키므로, 나쁜 브리지만 골라 종료한다.
+mapfile -t bridge_pids < <(pgrep -f '[d]ynamic_bridge' || true)
+bad_bridge_pids=()
+plain_bridge_pids=()
+for pid in "${bridge_pids[@]}"; do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    if [[ "$cmdline" == *"--bridge-all-topics"* ]]; then
+        bad_bridge_pids+=("$pid")
+    else
+        plain_bridge_pids+=("$pid")
+    fi
+done
+
+if [ "${#bad_bridge_pids[@]}" -gt 0 ]; then
+    echo "[motor] --bridge-all-topics 브리지 제거: PID ${bad_bridge_pids[*]}"
+    kill "${bad_bridge_pids[@]}"
+    for _ in $(seq 1 20); do
+        alive=0
+        for pid in "${bad_bridge_pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                alive=1
+                break
+            fi
+        done
+        [ "$alive" -eq 0 ] && break
+        sleep 0.1
+    done
+    if [ "$alive" -ne 0 ]; then
+        echo "[ERROR] 잘못된 dynamic_bridge가 종료되지 않았습니다: ${bad_bridge_pids[*]}"
+        exit 1
+    fi
+fi
+
+# 이미 정상 demand-driven 브리지가 있으면 중복 실행하지 않는다.
+mapfile -t remaining_bridge_pids < <(pgrep -f '[d]ynamic_bridge' || true)
+if [ "${#remaining_bridge_pids[@]}" -gt 0 ]; then
+    echo "[motor] 정상 dynamic_bridge가 이미 실행 중입니다: PID ${remaining_bridge_pids[*]}"
     exit 0
 fi
 

@@ -6,9 +6,13 @@ exponential smoothing factor, and its requested speed.  Mission-specific simulat
 logic (straight/curve switching, S-zone focus, boosts, preview speed, block
 steering, and re-anchoring) is deliberately absent.
 
-The node still keeps the safety and vehicle contracts that are not tuning
-features: source-stamp freshness, the 20 Hz ``/drive_cmd`` watchdog, fail-stop
-behaviour, and the installed vehicle ``CarInterface`` calibration/slew layer.
+The node keeps publishing at 20 Hz and owns the motor-speed command: it ramps
+from zero by the measured per-tick rise toward the active mode speed.  An
+explicit STOP still becomes zero on the same tick.  The installed
+vehicle ``CarInterface`` continues to own steering calibration/slew.  Path
+validity and timestamps are used only when accepting a replacement path.  A
+rejected or missing replacement never clears the last usable path and never
+stops propulsion.
 """
 
 from __future__ import annotations
@@ -34,8 +38,12 @@ ANGLE_MIN = -100.0
 ANGLE_MAX = 100.0
 DEBUG_HZ = 2.0
 AUDITED_CAR_INTERFACE_SHA256 = (
-    "6554c716957cc93eb77b626bca3554653708b130640a6860da55d8811b889091"
+    "595628d4c08bed8ddc59ad7e53bd5393084256f74b80815994544f957935d9f8"
 )
+# ``simple_motion`` shapes speed itself.  This value disables only the legacy
+# symmetric speed limiter inside this node's CarInterface instance; steering
+# calibration/slew and every other CarInterface user remain unchanged.
+CAR_SPEED_SLEW_BYPASS_PER_TICK = 100.0
 
 
 def simple_steering_command(
@@ -88,6 +96,150 @@ def smooth_steering(previous: float, target: float, alpha: float) -> float:
     return float(np.clip(previous + alpha * (target - previous), ANGLE_MIN, ANGLE_MAX))
 
 
+def motion_drive_allowed(
+    *,
+    cmd_fresh: bool,
+    cmd_valid: bool,
+    owner_lane: bool,
+    speed_cap: float,
+) -> bool:
+    """Return whether explicit drive authorization is currently usable.
+
+    Path availability is intentionally absent from this decision.  During a
+    perception dropout the controller continues with its cached path, or with
+    the last steering command when no path has ever been accepted.
+    """
+
+    cap = float(speed_cap)
+    return bool(
+        cmd_fresh
+        and cmd_valid
+        and owner_lane
+        and math.isfinite(cap)
+        and cap > 0.0
+    )
+
+
+def select_requested_speed(
+    profile_speed: float,
+    *,
+    cnn_mode: str,
+    cone_approach_active: bool,
+    cone_approach_speed: float,
+) -> tuple[float, bool]:
+    """Apply the START_R approach limit without changing the active CNN mode."""
+
+    requested = float(profile_speed)
+    approach = float(cone_approach_speed)
+    if not math.isfinite(requested) or requested <= 0.0:
+        raise ValueError("profile_speed must be positive and finite")
+    if not math.isfinite(approach) or approach <= 0.0:
+        raise ValueError("cone_approach_speed must be positive and finite")
+    limited = bool(cnn_mode == MODE_GENERAL and cone_approach_active)
+    return (min(requested, approach) if limited else requested), limited
+
+
+class TwoStageSpeedController:
+    """Shape motor speed while the node continues publishing every 20 Hz tick.
+
+    A stopped-to-driving transition starts at ``startup_speed_cmd`` (zero is
+    supported) and holds it for ``startup_hold_sec``.  It then moves
+    toward the current target by the configured up/down amount per timer tick.
+    Target changes while already driving never restart the startup hold.  A
+    drive-disable request always returns zero immediately and rearms startup for
+    the next genuine departure.
+    """
+
+    def __init__(
+        self,
+        *,
+        startup_speed_cmd: float,
+        startup_hold_sec: float,
+        slew_speed_up_per_tick: float,
+        slew_speed_down_per_tick: float,
+    ) -> None:
+        self.startup_speed_cmd = float(startup_speed_cmd)
+        self.startup_hold_sec = float(startup_hold_sec)
+        self.slew_speed_up_per_tick = float(slew_speed_up_per_tick)
+        self.slew_speed_down_per_tick = float(slew_speed_down_per_tick)
+        if not math.isfinite(self.startup_speed_cmd) or self.startup_speed_cmd < 0.0:
+            raise ValueError("startup_speed_cmd must be non-negative and finite")
+        if not math.isfinite(self.startup_hold_sec) or self.startup_hold_sec < 0.0:
+            raise ValueError("startup_hold_sec must be non-negative and finite")
+        if (
+            not math.isfinite(self.slew_speed_up_per_tick)
+            or self.slew_speed_up_per_tick <= 0.0
+        ):
+            raise ValueError("slew_speed_up_per_tick must be positive and finite")
+        if (
+            not math.isfinite(self.slew_speed_down_per_tick)
+            or self.slew_speed_down_per_tick <= 0.0
+        ):
+            raise ValueError("slew_speed_down_per_tick must be positive and finite")
+
+        self._driving = False
+        self._command = 0.0
+        self._startup_until_sec = 0.0
+        self._phase = "STOPPED"
+
+    @property
+    def command(self) -> float:
+        return self._command
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    def startup_remaining_sec(self, now_sec: float) -> float:
+        if self._phase != "STARTUP_HOLD":
+            return 0.0
+        return max(0.0, self._startup_until_sec - float(now_sec))
+
+    def update(self, *, drive: bool, target_speed: float, now_sec: float) -> float:
+        now = float(now_sec)
+        target = float(target_speed)
+        if not math.isfinite(now):
+            raise ValueError("now_sec must be finite")
+        if not math.isfinite(target) or target < 0.0:
+            raise ValueError("target_speed must be non-negative and finite")
+
+        if not drive:
+            self._driving = False
+            self._command = 0.0
+            self._startup_until_sec = now
+            self._phase = "STOPPED"
+            return self._command
+
+        if not self._driving:
+            self._driving = True
+            self._command = min(self.startup_speed_cmd, target)
+            self._startup_until_sec = now + self.startup_hold_sec
+            self._phase = (
+                "STARTUP_HOLD" if self.startup_hold_sec > 0.0 else "RUNNING"
+            )
+            return self._command
+
+        # If a new ceiling falls below the held command, obey it using the
+        # normal down-slew instead of waiting for startup hold to expire.
+        if target < self._command:
+            self._command -= min(
+                self._command - target, self.slew_speed_down_per_tick
+            )
+            self._startup_until_sec = now
+            self._phase = "RUNNING"
+            return self._command
+
+        if now < self._startup_until_sec:
+            self._phase = "STARTUP_HOLD"
+            return self._command
+
+        delta = target - self._command
+        if delta > 0.0:
+            self._command += min(delta, self.slew_speed_up_per_tick)
+        self._phase = "RUNNING"
+        return self._command
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -100,7 +252,7 @@ try:
     import rclpy
     from geometry_msgs.msg import PoseArray
     from rclpy.node import Node
-    from std_msgs.msg import Float32MultiArray, String
+    from std_msgs.msg import Bool, Float32MultiArray, String
     from track_drive.lib import drive_cmd as dc
     from track_drive.lib.car_interface import CarInterface, DEFAULT_CFG
 except ImportError:  # Pure steering helpers remain importable without ROS.
@@ -156,6 +308,20 @@ if rclpy is not None:
                 },
             }
             self._cnn_mode_topic = str(p("cnn_mode_topic", "/cnn_mode"))
+            self._cone_approach_topic = str(
+                p("cone_approach_topic", "/perception/cone_approach")
+            )
+            self._cone_approach_speed_cmd = float(
+                p("cone_approach_speed_cmd", 8.0)
+            )
+            self._startup_speed_cmd = float(p("startup_speed_cmd", 5.0))
+            self._startup_hold_sec = float(p("startup_hold_sec", 1.0))
+            self._slew_speed_up_per_tick = float(
+                p("slew_speed_up_per_tick", 0.75)
+            )
+            self._slew_speed_down_per_tick = float(
+                p("slew_speed_down_per_tick", 2.0)
+            )
             self._path_stale_sec = float(p("path_stale_sec", 0.25))
             self._future_tolerance_sec = float(
                 p("path_future_tolerance_sec", 0.05)
@@ -188,9 +354,28 @@ if rclpy is not None:
                     raise ValueError(f"{mode} speed_cmd must be positive and finite")
             if self._path_stale_sec <= 0.0 or self._future_tolerance_sec < 0.0:
                 raise ValueError("path timestamp policy is invalid")
+            if (
+                not math.isfinite(self._cone_approach_speed_cmd)
+                or self._cone_approach_speed_cmd <= 0.0
+            ):
+                raise ValueError(
+                    "cone_approach_speed_cmd must be positive and finite"
+                )
+
+            self._speed_controller = TwoStageSpeedController(
+                startup_speed_cmd=self._startup_speed_cmd,
+                startup_hold_sec=self._startup_hold_sec,
+                slew_speed_up_per_tick=self._slew_speed_up_per_tick,
+                slew_speed_down_per_tick=self._slew_speed_down_per_tick,
+            )
 
             self._verify_installed_car_interface()
             car_cfg = {key: p(key, DEFAULT_CFG[key]) for key in sorted(DEFAULT_CFG)}
+            # The controller above owns the measured motor ramp.  Bypass both
+            # CarInterface's legacy slew and dead-zone snap for this instance:
+            # sub-dead-zone commands are intentional during a smooth launch.
+            car_cfg["slew_speed_per_tick"] = CAR_SPEED_SLEW_BYPASS_PER_TICK
+            car_cfg["speed_deadzone"] = 0.0
             self._car = CarInterface(car_cfg)
 
             self._path_x: Optional[np.ndarray] = None
@@ -201,6 +386,7 @@ if rclpy is not None:
             self._cmd_receive_ns = -1
             self._angle_cmd = 0.0
             self._cnn_mode = MODE_GENERAL
+            self._cone_approach_active = False
             self._debug: dict[str, Any] = {
                 "drive": False,
                 "reason": "startup",
@@ -212,6 +398,9 @@ if rclpy is not None:
             )
             self.create_subscription(
                 String, self._cnn_mode_topic, self._on_cnn_mode, 10
+            )
+            self.create_subscription(
+                Bool, self._cone_approach_topic, self._on_cone_approach, 10
             )
             self._motor_pub = self.create_publisher(
                 Float32MultiArray, "/xycar_motor", 10
@@ -227,6 +416,17 @@ if rclpy is not None:
                 for mode, profile in self._profiles.items()
             )
             self.get_logger().info(f"simple motion ready: {summary}")
+            self.get_logger().info(
+                "START_R approach: GENERAL speed limited to "
+                f"{self._cone_approach_speed_cmd:.1f} on "
+                f"{self._cone_approach_topic}"
+            )
+            self.get_logger().info(
+                "motor speed ramp: start="
+                f"{self._startup_speed_cmd:.1f} hold={self._startup_hold_sec:.1f}s, "
+                f"up={self._slew_speed_up_per_tick:.2f}/tick, "
+                f"down={self._slew_speed_down_per_tick:.2f}/tick, STOP=immediate"
+            )
 
         def _parameter(self, name: str, default: Any) -> Any:
             self.declare_parameter(name, default)
@@ -249,27 +449,23 @@ if rclpy is not None:
                     f"source={source}"
                 )
 
-        def _clear_path(self, reason: str) -> None:
-            self._path_x = None
-            self._path_y = None
-            self._path_source_ns = -1
+        def _reject_path(self, reason: str) -> None:
             self.get_logger().warning(
-                f"simple motion path cleared: {reason}",
+                f"simple motion ignoring path: {reason}; keeping last steering/path",
                 throttle_duration_sec=1.0,
             )
 
         def _on_path(self, message: PoseArray) -> None:
             if str(message.header.frame_id) != self._path_frame_id:
-                self._clear_path("wrong frame")
+                self._reject_path("wrong frame")
                 return
             try:
                 source_ns = stamp_to_ns(message.header.stamp)
             except ValueError as exc:
-                self._clear_path(str(exc))
+                self._reject_path(str(exc))
                 return
             if source_ns < self._last_seen_path_ns:
                 return
-            self._last_seen_path_ns = source_ns
             now_ns = self.get_clock().now().nanoseconds
             try:
                 validate_source_stamp_ns(
@@ -285,8 +481,12 @@ if rclpy is not None:
                     x_max=3.0,
                 )
             except ValueError as exc:
-                self._clear_path(str(exc))
+                self._reject_path(str(exc))
                 return
+            # Advance ordering only after a replacement path is accepted.  A
+            # malformed message with a far-future stamp must not block later
+            # valid paths from restoring steering updates.
+            self._last_seen_path_ns = source_ns
             self._path_x = path.x
             self._path_y = path.y
             self._path_source_ns = source_ns
@@ -307,11 +507,23 @@ if rclpy is not None:
                 self._cnn_mode = requested
                 self.get_logger().info(f"simple motion profile: {self._cnn_mode}")
 
+        def _on_cone_approach(self, message: Bool) -> None:
+            active = bool(message.data)
+            if active != self._cone_approach_active:
+                self._cone_approach_active = active
+                self.get_logger().info(
+                    "START_R approach speed limit: "
+                    + ("ACTIVE" if active else "released")
+                )
+
         def _fresh_path(self, now_ns: int) -> bool:
             if self._path_x is None or self._path_y is None:
                 return False
             age = (now_ns - self._path_source_ns) * 1e-9
             return -self._future_tolerance_sec <= age <= self._path_stale_sec
+
+        def _has_path(self) -> bool:
+            return self._path_x is not None and self._path_y is not None
 
         def _fresh_drive_cmd(self, now_ns: int) -> bool:
             if self._cmd_receive_ns <= 0:
@@ -326,42 +538,57 @@ if rclpy is not None:
             cmd_valid = bool(self._cmd.get("valid", False))
             speed_cap = float(self._cmd.get("speed_cap", 0.0))
             speed_cap_ok = math.isfinite(speed_cap) and speed_cap > 0.0
-            drive = path_fresh and cmd_fresh and cmd_valid and owner_lane and speed_cap_ok
+            path_available = self._has_path()
+            drive = motion_drive_allowed(
+                cmd_fresh=cmd_fresh,
+                cmd_valid=cmd_valid,
+                owner_lane=owner_lane,
+                speed_cap=speed_cap,
+            )
 
             profile = self._cnn_mode
             active = self._profiles[profile]
             lookahead_m = active["lookahead_m"]
             steer_gain = active["steer_gain"]
             steer_alpha = active["steer_smooth_alpha"]
-            requested_speed = active["speed_cmd"]
+            profile_speed = active["speed_cmd"]
+            requested_speed, approach_speed_limited = select_requested_speed(
+                profile_speed,
+                cnn_mode=profile,
+                cone_approach_active=self._cone_approach_active,
+                cone_approach_speed=self._cone_approach_speed_cmd,
+            )
 
             raw_angle = self._angle_cmd
             target_x = None
             target_y = None
             reason = "ok"
             if drive:
-                try:
-                    raw_angle, target_x, target_y = simple_steering_command(
-                        self._path_x,
-                        self._path_y,
-                        lookahead_m=lookahead_m,
-                        steer_gain=steer_gain,
-                    )
-                    self._angle_cmd = smooth_steering(
-                        self._angle_cmd, raw_angle, steer_alpha
-                    )
-                    # /drive_cmd remains the global ceiling and STOP watchdog;
-                    # the active motion profile owns the requested speed.
-                    speed_cmd = min(speed_cap, requested_speed)
-                except ValueError as exc:
-                    drive = False
-                    speed_cmd = 0.0
-                    reason = f"steering_error:{exc}"
+                # /drive_cmd remains the global ceiling and explicit STOP
+                # watchdog; the active motion profile owns requested speed.
+                target_speed = min(speed_cap, requested_speed)
+                if path_available:
+                    try:
+                        raw_angle, target_x, target_y = simple_steering_command(
+                            self._path_x,
+                            self._path_y,
+                            lookahead_m=lookahead_m,
+                            steer_gain=steer_gain,
+                        )
+                        self._angle_cmd = smooth_steering(
+                            self._angle_cmd, raw_angle, steer_alpha
+                        )
+                        if not path_fresh:
+                            reason = "holding_last_path"
+                    except ValueError as exc:
+                        # Cached-path failures also retain the last steering and
+                        # speed instead of producing a one-cycle STOP command.
+                        reason = f"holding_last_steering:{exc}"
+                else:
+                    reason = "holding_last_steering_no_path"
             else:
-                speed_cmd = 0.0
-                if not path_fresh:
-                    reason = "path_missing_or_stale"
-                elif not cmd_fresh:
+                target_speed = 0.0
+                if not cmd_fresh:
                     reason = "drive_cmd_stale"
                 elif not cmd_valid:
                     reason = "drive_cmd_invalid"
@@ -370,9 +597,17 @@ if rclpy is not None:
                 else:
                     reason = "speed_cap_missing"
 
+            now_sec = now_ns * 1e-9
+            speed_cmd = self._speed_controller.update(
+                drive=drive,
+                target_speed=target_speed,
+                now_sec=now_sec,
+            )
+
             # STOP retains the last logical steering angle.  CarInterface owns
-            # the measured left/right scaling, mechanical clamps, and both
-            # steering and speed slew at 20 Hz.
+            # the measured left/right scaling, mechanical clamps, and steering
+            # slew.  The two-stage controller above owns motor-speed slew while
+            # this node continues publishing every 20 Hz tick.
             angle_out, speed_out = self._car.to_motor(self._angle_cmd, speed_cmd)
             output = Float32MultiArray()
             output.data = [float(angle_out), float(speed_out)]
@@ -383,7 +618,9 @@ if rclpy is not None:
                 "profile": profile,
                 "drive": drive,
                 "reason": reason,
+                "path_available": path_available,
                 "path_fresh": path_fresh,
+                "path_reused": path_available and not path_fresh,
                 "cmd_fresh": cmd_fresh,
                 "lookahead_m": lookahead_m,
                 "steer_gain": steer_gain,
@@ -394,8 +631,22 @@ if rclpy is not None:
                 "angle_cmd": self._angle_cmd,
                 "angle_out": angle_out,
                 "speed_cap": speed_cap,
+                "profile_speed": profile_speed,
                 "requested_speed": requested_speed,
+                "target_speed": target_speed,
+                "shaped_speed_cmd": speed_cmd,
                 "speed_out": speed_out,
+                "speed_phase": self._speed_controller.phase,
+                "startup_remaining_sec": self._speed_controller.startup_remaining_sec(
+                    now_sec
+                ),
+                "startup_speed_cmd": self._startup_speed_cmd,
+                "startup_hold_sec": self._startup_hold_sec,
+                "slew_speed_up_per_tick": self._slew_speed_up_per_tick,
+                "slew_speed_down_per_tick": self._slew_speed_down_per_tick,
+                "cone_approach_active": self._cone_approach_active,
+                "cone_approach_speed_limited": approach_speed_limited,
+                "cone_approach_speed_cmd": self._cone_approach_speed_cmd,
             }
 
         def _tick_debug(self) -> None:

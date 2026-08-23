@@ -5,21 +5,14 @@ yolo_bev_node:
     signal_topic: "/perception/signals"       # 신호등/LEFT 검출 출력
     yolo_state_topic: "/debug/yolo_state"     # START_R 좌표 등 viewer 진단
     # 배포 시 실제 install 경로로 바꾼다. OpenVINO 검증 후에는 *_openvino_model 폴더.
-    model_path: "/home/xytron/xycar_ws/models/traffic_detector_seg_best_openvino_model" # lane/mid/START_R/traffic_light 검출
-    expected_model_sha256: "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59" # 검출 원본 PT 무결성
-    classifier_model_path: "/home/xytron/xycar_ws/models/traffic_light_cls_best_openvino_model" # 신호등 crop 4분류
-    classifier_expected_model_sha256: "5bb0e96f38977a98d7a7d336a8d4a0b40cb91f3a0c58b03ce947c84b163b1287" # 분류 원본 PT 무결성
-    classifier_imgsz: [224, 224]                # 분류기 정적 OpenVINO 입력 H,W
-    traffic_light_class_name: "traffic_light"  # 이 박스가 있을 때만 분류 실행
-    traffic_light_conf: 0.25                    # 신호등 박스 최소 검출 confidence
-    traffic_light_crop_padding: 0.12            # 박스 둘레 12% 여백을 포함해 분류
-    traffic_light_crop_min_px: 8                # 너무 작은 crop은 분류하지 않음
+    model_path: "/home/xytron/xycar_ws/models/best_7_97fae5_gpt_openvino_model" # YOLO/OpenVINO 모델
+    expected_model_sha256: "97fae5f51ebd9a3ccb1535a243420d2fb555af4242249ee30b1961ff2b083555" # 원본 PT 무결성값
     camera_yaml: "/home/xytron/xycar_ws/install/track_drive_cnn_gpt/share/track_drive_cnn_gpt/config/camera.yaml" # BEV 카메라 보정
     # 1920x1080의 기존 PyTorch imgsz=640 auto-letterbox 실제 텐서와 동일.
     # OpenVINO export manifest도 반드시 static [384,640]이어야 한다.
     imgsz: [384, 640]                          # YOLO 실제 추론 텐서 H,W
     conf: 0.25                                 # 전체 검출 최소 confidence
-    signal_conf: 0.25                          # mission/viewer의 분류 확률 기준값
+    signal_conf: 0.25                          # 신호등 클래스 최소 confidence
     # =====================================================================
     # [현장 수정 A] START_R -> CONE 진입 시점
     # 판단 좌표는 박스 중심이 아니라 박스의 맨 아래 y2이다(화면 위=0, 아래=1).
@@ -62,7 +55,6 @@ cnn_path_node:
     route_reset_topic: "/route_intent_reset"    # 지름길 강제 초기화 입력
     traffic_stop_topic: "/traffic_stop"         # 신호등 STOP 출력
     traffic_stop_reset_topic: "/traffic_stop_reset" # STOP 강제 해제 입력
-    race_go_topic: "/race_go"                   # GREEN 자동출발 상태 출력
     cone_trigger_topic: "/perception/cone_trigger"  # START_R raw trigger 입력
     start_r_detected_topic: "/perception/start_r_detected" # OVERTAKE 선차단 입력
     cnn_mode_topic: "/cnn_mode"                 # 현재 4-CNN 모드 출력
@@ -74,9 +66,9 @@ cnn_path_node:
     # =====================================================================
     left_confirm_frames: 2           # LEFT 및 정지선 신호 연속 확인 횟수
     left_confidence: 0.25            # LEFT 최소 confidence
-    shortcut_hold_sec: 13.0          # SHORTCUT 유지시간
-    overtake_hold_sec: 3.0           # OVERTAKE 단일 프로필 유지시간
-    cone_hold_sec: 10.0              # CONE 유지시간(위 exit_hold와 다름)
+    shortcut_hold_sec: 10.0          # SHORTCUT 유지시간
+    overtake_hold_sec: 7.0           # OVERTAKE 유지시간
+    cone_hold_sec: 14.0              # CONE 유지시간(위 exit_hold와 다름)
     left_confirm_window_sec: 1.5     # 이 시간 안에 LEFT 2회 필요
     left_rearm_absent_frames: 3      # LEFT 재무장에 필요한 미검출 프레임
 
@@ -89,26 +81,13 @@ cnn_path_node:
     # =====================================================================
     signal_decision_center_y_max: 0.22 # 신호 박스 중심 y 최대값(작을수록 위쪽)
     signal_decision_min_width: 0.08    # 신호 박스 최소 화면 폭 비율
-
-    # =====================================================================
-    # [대회 주행] GREEN 자동출발 / 랩 카운트 / 3랩 완주정지
-    # 최초 출발은 GREEN 연속 확인만 사용하고 박스 중심/폭 조건은 보지
-    # 않는다. 출발은 LAP=0이다. 이후 같은 정지선에 다시 도착할 때마다
-    # 박스 중심/폭 조건을 적용해 1랩으로 세며, 같은 통과의 반복 검출은 아래
-    # 재무장 프레임과 10초 쿨타임을 모두 만족해야 다시 셀 수 있다.
-    # 연습에서 계속 돌 때는 race_finish_enabled만 false로 바꾼다.
-    # =====================================================================
-    race_finish_enabled: true          # true: 목표 랩에서 정지, false: 계속 주행
-    race_target_laps: 3                # 완주로 판단할 랩 수
-    race_lap_cooldown_sec: 10.0        # 한 바퀴보다 짧은 중복 인식 차단시간(s)
-    race_lap_clear_frames: 5           # 정지선 zone 이탈 연속 프레임 후 재무장
     # 네 모델을 시작 시 한 번 올리고 active mode 한 개만 추론한다.
     general_model_path: "/home/xytron/xycar_ws/models/general_single_best_gpt.pt" # 일반 CNN
     general_expected_sha256: "e90b0de551fdcdde5a5de96d754365380f49db412242535313c396a77201c1b1" # 일반 CNN 무결성
     shortcut_model_path: "/home/xytron/xycar_ws/models/left_shortcut_single_best_gpt.pt" # 지름길 CNN
     shortcut_expected_sha256: "88dc9a1da262c2622e2b618f1fb6789aa5027f3fc3f9bc03c04dcdbef648ae1a" # 지름길 CNN 무결성
-    overtake_model_path: "/home/xytron/xycar_ws/models/obstacle_single_main508_best_gpt.pt" # 추월 CNN
-    overtake_expected_sha256: "87fd7a0363d8544a1801b446a5ca16bcfcfd483ea52a8921255eb98562751003" # 추월 CNN 무결성
+    overtake_model_path: "/home/xytron/xycar_ws/models/obstacle_single_best_gpt.pt" # 추월 CNN
+    overtake_expected_sha256: "23ff59b918a5af0dbbd31dfb8dcd41713b5c8554f5e38cdf8f07ed1bb37fb463" # 추월 CNN 무결성
     cone_model_path: "/home/xytron/xycar_ws/models/cone_single_all967_final_gpt.pt" # 라바콘 CNN
     cone_expected_sha256: "4844b66bb4440580b2cf39cc6ac7e5e8cc9538d3c1a13579f5267094abb18d13" # 라바콘 CNN 무결성
     device: "cpu"                             # CNN 실행 장치
@@ -130,12 +109,12 @@ cnn_path_node:
     # [현장 수정 D] 도로 안 장애물 -> OVERTAKE trigger
     # 우선 조정값: min_raw_points, min_inside_ratio, confirm_frames.
     # 못 잡으면 앞의 두 값을 낮추고, 잡음에도 켜지면 높인다.
-    # inward_margin=0.10m와 x_max=1.40m는 현재 실차 계약이다.
+    # inward_margin=0.10m와 x_max=1.20m는 승인된 고정 계약이다.
     # =====================================================================
     overtake_inward_margin_m: 0.10              # 흰선에서 도로 안쪽 여백(m), 고정
     overtake_white_guard_m: 0.05                # 흰선 반사점 제외 여백(m)
     overtake_x_min_m: 0.0                       # 장애물 검사 시작 전방거리(m)
-    overtake_x_max_m: 1.40                      # 장애물 검사 끝 전방거리(m), 고정
+    overtake_x_max_m: 1.20                      # 장애물 검사 끝 전방거리(m), 고정
     overtake_min_raw_points: 3                  # trigger 최소 cluster 점 개수
     overtake_min_inside_ratio: 0.50             # cluster 중 도로 안 점 최소 비율
     overtake_min_road_width_m: 0.35             # 유효 도로 최소 폭(m)
@@ -166,7 +145,6 @@ cnn_drive_gate_node:
     center_path_topic: "/center_path"          # 최종 CNN 경로 입력
     drive_cmd_topic: "/drive_cmd"              # motion 허용/속도상한 출력
     manual_go_topic: "/manual_go"              # 수동 주행허용 입력
-    race_go_topic: "/race_go"                  # GREEN 자동 주행허용 입력
     emergency_stop_topic: "/emergency_stop"    # 비상정지 입력
     traffic_stop_topic: "/traffic_stop"        # 신호등 정지 입력
     control_hz: 20.0                             # gate 출력 주기
@@ -175,9 +153,9 @@ cnn_drive_gate_node:
     path_frame_id: "lidar_frame"                # 허용 경로 좌표계
     # 경로 선택/중계는 하지 않는다. false이면 20Hz STOP만 발행한다.
     enable_drive: false                          # launch에서 실제 주행 시 override
-    # false이면 GREEN 전 WAIT. /manual_go를 직접 보내면 자동 상태보다
-    # 수동 true/false가 우선하며, 정상 대회 주행에는 별도 명령이 필요 없다.
-    initial_manual_go: false                     # 수동 override 초기값(평소 false)
+    # 실제 주행 launch에서는 false 유지. 모터 토픽이 완전히 remap된
+    # live_pipeline_dry_run.launch.py만 true로 override한다.
+    initial_manual_go: false                     # 시작 직후 자동 GO 여부
     speed_cap: 6.0                               # 모든 모드 공통 속도 상한
 
 live_pipeline_viewer_node:

@@ -32,7 +32,7 @@ DEFAULT_CFG = {
     "steer_limit_left": -62.593314622,
     "steer_limit_right": 58.592366078,
     "slew_angle_per_tick": 8.0,   # 틱당 조향 출력 변화 상한
-    "slew_speed_per_tick": 1.5,   # 틱당 속도 출력 변화 상한 (센서리스 기동 램프)
+    "slew_speed_per_tick": 0.25,  # 지상 실차 측정: 20Hz에서 0->12 약 2.4초
     "speed_deadzone": 4.0,        # 이 미만 명령은 안 구름 (실측)
     "allow_reverse": False,       # False면 속도 [0, 100] 클립
     "cmd_to_ms": 0.08,            # speed 명령 ×0.08 = m/s (실측검증)

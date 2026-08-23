@@ -1,4 +1,4 @@
-"""Latest-frame-only YOLO segmentation to full-topology BEV ROS 2 node."""
+"""Latest-frame-only BEV plus conditional traffic-light classification node."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from std_msgs.msg import Bool, String
 from ultralytics import YOLO
 
 from .bev_geometry import (
-    DEFAULT_EXPECTED_MODEL_SHA256,
     GRID_H,
     GRID_W,
     BevMaskRemapper,
@@ -35,16 +34,26 @@ from .bev_geometry import (
     normalize_imgsz,
     optional_native_mask_hw,
     remap_optional_native_masks,
+    validate_classifier_model_contract,
     validate_model_contract,
 )
 from .signal_mission import (
+    classifier_detections_from_traffic_light,
+    crop_normalized_detection,
     encode_signal_payload,
     extract_class_detection,
-    extract_signal_confidences,
-    extract_signal_detections,
+    extract_classifier_probabilities,
     optional_class_id,
     signal_class_ids,
     TimedTriggerLatch,
+)
+
+
+DETECTOR_SOURCE_SHA256 = (
+    "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59"
+)
+CLASSIFIER_SOURCE_SHA256 = (
+    "5bb0e96f38977a98d7a7d336a8d4a0b40cb91f3a0c58b03ce947c84b163b1287"
 )
 
 
@@ -143,6 +152,8 @@ _SIGNAL_COLORS = {
     "LEFT": (255, 220, 30),
     "RED": (30, 30, 240),
     "YELLOW": (0, 220, 255),
+    "START_R": (255, 220, 30),
+    "traffic_light": (255, 200, 30),
 }
 
 
@@ -161,14 +172,17 @@ def _as_numpy(value: Any) -> np.ndarray:
 def make_signal_preview(
     bgr: np.ndarray,
     result: Any,
-    signal_ids: dict[str, int],
+    traffic_light_id: int,
     signals: dict[str, float],
     *,
+    traffic_detection: dict[str, float] | None = None,
+    cone_trigger_id: int | None = None,
+    cone_detection: dict[str, float] | None = None,
     sequence: int,
     inference_ms: float,
     output_width: int = 960,
 ) -> np.ndarray:
-    """Draw only the four traffic-signal classes from the shared YOLO result."""
+    """Draw detector traffic-light/START_R boxes and classifier probabilities."""
 
     if bgr.ndim != 3 or bgr.shape[2] != 3:
         raise ValueError(f"expected BGR HxWx3, got {bgr.shape}")
@@ -177,7 +191,9 @@ def make_signal_preview(
     height = max(1, int(round(float(bgr.shape[0]) * scale)))
     view = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
 
-    id_to_name = {int(class_id): name for name, class_id in signal_ids.items()}
+    id_to_name = {int(traffic_light_id): "traffic_light"}
+    if cone_trigger_id is not None:
+        id_to_name[int(cone_trigger_id)] = "START_R"
     boxes = getattr(result, "boxes", None)
     if boxes is not None and getattr(boxes, "xyxy", None) is not None:
         xyxy = _as_numpy(boxes.xyxy).reshape(-1, 4)
@@ -188,6 +204,11 @@ def make_signal_preview(
             name = id_to_name.get(int(classes[index]))
             if name is None:
                 continue
+            source_x1, source_y1, source_x2, source_y2 = np.rint(
+                xyxy[index]
+            ).astype(np.int32)
+            source_cx = int(round(0.5 * (source_x1 + source_x2)))
+            source_cy = int(round(0.5 * (source_y1 + source_y2)))
             x1, y1, x2, y2 = np.rint(xyxy[index] * scale).astype(np.int32)
             x1 = int(np.clip(x1, 0, width - 1))
             x2 = int(np.clip(x2, 0, width - 1))
@@ -195,7 +216,11 @@ def make_signal_preview(
             y2 = int(np.clip(y2, 0, height - 1))
             color = _SIGNAL_COLORS[name]
             cv2.rectangle(view, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-            label = f"{name} {float(confidences[index]):.2f}"
+            label = (
+                f"{name} {float(confidences[index]):.2f} "
+                f"C({source_cx},{source_cy}) "
+                f"B({source_x1},{source_y1},{source_x2},{source_y2})"
+            )
             label_y = max(62, y1 - 7)
             cv2.putText(
                 view,
@@ -210,8 +235,12 @@ def make_signal_preview(
 
     cv2.rectangle(view, (0, 0), (width, 54), (10, 10, 10), -1)
     status_parts = []
-    for name in ("GREEN", "LEFT", "RED", "YELLOW"):
-        confidence = signals.get(name)
+    for name in ("GREEN", "LEFT", "RED", "YELLOW", "START_R"):
+        confidence = (
+            cone_detection.get("confidence")
+            if name == "START_R" and cone_detection is not None
+            else signals.get(name)
+        )
         status_parts.append(
             f"{name}:{confidence:.2f}" if confidence is not None else f"{name}:--"
         )
@@ -225,9 +254,19 @@ def make_signal_preview(
         2,
         cv2.LINE_AA,
     )
+    detector_confidence = (
+        None
+        if traffic_detection is None
+        else float(traffic_detection["confidence"])
+    )
+    detector_text = (
+        f"{detector_confidence:.2f}" if detector_confidence is not None else "--"
+    )
     cv2.putText(
         view,
-        f"frame={int(sequence)}  inference={float(inference_ms):.1f}ms  q:quit  s:save",
+        f"frame={int(sequence)}  detector={float(inference_ms):.1f}ms  "
+        f"traffic_det={detector_text}  "
+        f"source={int(bgr.shape[1])}x{int(bgr.shape[0])} px  q:quit  s:save",
         (12, 47),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.52,
@@ -239,7 +278,7 @@ def make_signal_preview(
 
 
 class YoloBevNode(Node):
-    """Run exactly one seven-class v3 segmentation model on the newest frame."""
+    """Run one detector and conditionally classify its traffic-light crop."""
 
     def __init__(self) -> None:
         super().__init__("yolo_bev_node")
@@ -247,19 +286,44 @@ class YoloBevNode(Node):
         self.declare_parameter("image_topic", "/image_raw")
         self.declare_parameter("bev_topic", "/perception/bev")
         self.declare_parameter("signal_topic", "/perception/signals")
+        self.declare_parameter("yolo_state_topic", "/debug/yolo_state")
         self.declare_parameter("diag_topic", "/diagnostics/yolo_bev_timing")
-        self.declare_parameter("model_path", "/home/xytron/xycar_ws/models/best_v3_gpt.pt")
         self.declare_parameter(
-            "expected_model_sha256", DEFAULT_EXPECTED_MODEL_SHA256
+            "model_path",
+            "/home/xytron/xycar_ws/models/traffic_detector_seg_best_openvino_model",
         )
+        self.declare_parameter(
+            "expected_model_sha256", DETECTOR_SOURCE_SHA256
+        )
+        self.declare_parameter(
+            "classifier_model_path",
+            "/home/xytron/xycar_ws/models/traffic_light_cls_best_openvino_model",
+        )
+        self.declare_parameter(
+            "classifier_expected_model_sha256", CLASSIFIER_SOURCE_SHA256
+        )
+        self.declare_parameter("classifier_imgsz", [224, 224])
+        self.declare_parameter("traffic_light_class_name", "traffic_light")
+        self.declare_parameter("traffic_light_conf", 0.25)
+        self.declare_parameter("traffic_light_crop_padding", 0.12)
+        self.declare_parameter("traffic_light_crop_min_px", 8)
         self.declare_parameter("camera_yaml", "")
         self.declare_parameter("imgsz", [384, 640])
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("signal_conf", 0.25)
         self.declare_parameter("cone_mode_topic", "/cone_mode")
+        self.declare_parameter(
+            "start_r_detected_topic", "/perception/start_r_detected"
+        )
+        self.declare_parameter(
+            "cone_approach_topic", "/perception/cone_approach"
+        )
         # Roboflow v3 names the cone-section trigger class START_R.
         self.declare_parameter("cone_trigger_class_name", "START_R")
         self.declare_parameter("cone_trigger_conf", 0.25)
+        self.declare_parameter("cone_approach_bottom_y_min", 0.70)
+        self.declare_parameter("cone_approach_confirm_frames", 1)
+        self.declare_parameter("cone_approach_exit_hold_sec", 1.0)
         self.declare_parameter("cone_enter_bottom_y_min", 0.55)
         self.declare_parameter("cone_enter_confirm_frames", 2)
         self.declare_parameter("cone_exit_hold_sec", 1.0)
@@ -280,36 +344,85 @@ class YoloBevNode(Node):
         self._image_topic = str(self.get_parameter("image_topic").value)
         self._bev_topic = str(self.get_parameter("bev_topic").value)
         self._signal_topic = str(self.get_parameter("signal_topic").value)
+        self._yolo_state_topic = str(
+            self.get_parameter("yolo_state_topic").value
+        )
         self._cone_mode_topic = str(self.get_parameter("cone_mode_topic").value)
+        self._start_r_detected_topic = str(
+            self.get_parameter("start_r_detected_topic").value
+        )
+        self._cone_approach_topic = str(
+            self.get_parameter("cone_approach_topic").value
+        )
         self._diag_topic = str(self.get_parameter("diag_topic").value)
         self._model_path = Path(str(self.get_parameter("model_path").value)).expanduser()
         self._expected_model_sha256 = str(
             self.get_parameter("expected_model_sha256").value
         )
+        self._classifier_model_path = Path(
+            str(self.get_parameter("classifier_model_path").value)
+        ).expanduser()
+        self._classifier_expected_model_sha256 = str(
+            self.get_parameter("classifier_expected_model_sha256").value
+        )
         camera_yaml = Path(str(self.get_parameter("camera_yaml").value)).expanduser()
         self._imgsz = normalize_imgsz(self.get_parameter("imgsz").value)
+        self._classifier_imgsz = normalize_imgsz(
+            self.get_parameter("classifier_imgsz").value
+        )
         self._conf = float(self.get_parameter("conf").value)
         self._signal_conf = float(self.get_parameter("signal_conf").value)
+        self._traffic_light_class_name = str(
+            self.get_parameter("traffic_light_class_name").value
+        ).strip()
+        self._traffic_light_conf = float(
+            self.get_parameter("traffic_light_conf").value
+        )
+        self._traffic_light_crop_padding = float(
+            self.get_parameter("traffic_light_crop_padding").value
+        )
+        self._traffic_light_crop_min_px = int(
+            self.get_parameter("traffic_light_crop_min_px").value
+        )
         self._cone_trigger_class_name = str(
             self.get_parameter("cone_trigger_class_name").value
         ).strip()
         self._cone_trigger_conf = float(
             self.get_parameter("cone_trigger_conf").value
         )
+        self._cone_approach_bottom_y_min = float(
+            self.get_parameter("cone_approach_bottom_y_min").value
+        )
         self._cone_enter_bottom_y_min = float(
             self.get_parameter("cone_enter_bottom_y_min").value
         )
         if not 0.0 <= self._signal_conf <= 1.0:
             raise ValueError("signal_conf must be within [0, 1]")
-        if self._signal_conf < self._conf:
-            raise ValueError(
-                "signal_conf cannot be lower than conf because Ultralytics "
-                "already removes boxes below conf in the shared inference result"
-            )
+        if not self._conf <= self._traffic_light_conf <= 1.0:
+            raise ValueError("traffic_light_conf must be within [conf, 1]")
+        if not 0.0 <= self._traffic_light_crop_padding <= 1.0:
+            raise ValueError("traffic_light_crop_padding must be within [0, 1]")
+        if self._traffic_light_crop_min_px < 1:
+            raise ValueError("traffic_light_crop_min_px must be positive")
         if not self._conf <= self._cone_trigger_conf <= 1.0:
             raise ValueError("cone_trigger_conf must be within [conf, 1]")
+        if not 0.0 <= self._cone_approach_bottom_y_min <= 1.0:
+            raise ValueError("cone_approach_bottom_y_min must be within [0, 1]")
         if not 0.0 <= self._cone_enter_bottom_y_min <= 1.0:
             raise ValueError("cone_enter_bottom_y_min must be within [0, 1]")
+        if self._cone_approach_bottom_y_min >= self._cone_enter_bottom_y_min:
+            raise ValueError(
+                "cone_approach_bottom_y_min must be lower than "
+                "cone_enter_bottom_y_min"
+            )
+        self._cone_approach_latch = TimedTriggerLatch(
+            enter_confirm_frames=int(
+                self.get_parameter("cone_approach_confirm_frames").value
+            ),
+            exit_hold_sec=float(
+                self.get_parameter("cone_approach_exit_hold_sec").value
+            ),
+        )
         self._cone_mode_latch = TimedTriggerLatch(
             enter_confirm_frames=int(
                 self.get_parameter("cone_enter_confirm_frames").value
@@ -343,6 +456,11 @@ class YoloBevNode(Node):
         self._backend = validate_model_contract(
             self._model_path, self._expected_model_sha256, self._imgsz
         )
+        self._classifier_backend = validate_classifier_model_contract(
+            self._classifier_model_path,
+            self._classifier_expected_model_sha256,
+            self._classifier_imgsz,
+        )
         if not camera_yaml.is_file():
             raise FileNotFoundError(f"camera_yaml does not exist: {camera_yaml}")
         self._camera = load_camera(camera_yaml)
@@ -357,10 +475,21 @@ class YoloBevNode(Node):
         self._model = YOLO(str(self._model_path), task="segment")
         names = model_class_names(self._model_path, self._model)
         self._lane_id, self._mid_id = class_ids(names)
-        # Signals are extracted from this same Results object; no second model
-        # or inference pass is permitted.  Fail closed if a lane-only checkpoint
-        # is accidentally deployed instead of the seven-class v3 model.
-        self._signal_ids = signal_class_ids(names)
+        self._traffic_light_id = optional_class_id(
+            names, self._traffic_light_class_name
+        )
+        if self._traffic_light_id is None:
+            raise ValueError(
+                "detector is missing required traffic-light class: "
+                f"{self._traffic_light_class_name!r}"
+            )
+        self._signal_classifier = YOLO(
+            str(self._classifier_model_path), task="classify"
+        )
+        classifier_names = model_class_names(
+            self._classifier_model_path, self._signal_classifier
+        )
+        self._signal_ids = signal_class_ids(classifier_names)
         self._cone_trigger_id = optional_class_id(
             names, self._cone_trigger_class_name
         )
@@ -369,6 +498,7 @@ class YoloBevNode(Node):
                 "cone trigger class is not in this model; /cone_mode remains false: "
                 f"name={self._cone_trigger_class_name!r}"
             )
+        self._warm_models()
 
         self._latest = _LatestOnlyBuffer()
         self._stopping = threading.Event()
@@ -390,8 +520,20 @@ class YoloBevNode(Node):
         self._signal_publisher = self.create_publisher(
             String, self._signal_topic, 1
         )
+        # This is a small viewer-only JSON stream.  The publisher exists so a
+        # dashboard can attach later, but serialization is skipped entirely
+        # while there is no subscriber.
+        self._yolo_state_publisher = self.create_publisher(
+            String, self._yolo_state_topic, 1
+        )
         self._cone_mode_publisher = self.create_publisher(
             Bool, self._cone_mode_topic, 1
+        )
+        self._start_r_detected_publisher = self.create_publisher(
+            Bool, self._start_r_detected_topic, 1
+        )
+        self._cone_approach_publisher = self.create_publisher(
+            Bool, self._cone_approach_topic, 1
         )
         self._diag_publisher = (
             self.create_publisher(String, self._diag_topic, 10)
@@ -421,24 +563,59 @@ class YoloBevNode(Node):
                 "event": "yolo_bev_ready",
                 "backend": self._backend,
                 "model_path": str(self._model_path),
+                "classifier_backend": self._classifier_backend,
+                "classifier_model_path": str(self._classifier_model_path),
                 "lane_id": self._lane_id,
                 "mid_id": self._mid_id,
+                "traffic_light_id": self._traffic_light_id,
                 "signal_ids": self._signal_ids,
                 "signal_topic": self._signal_topic,
+                "yolo_state_topic": self._yolo_state_topic,
                 "signal_conf": self._signal_conf,
                 "cone_trigger_class_name": self._cone_trigger_class_name,
                 "cone_trigger_id": self._cone_trigger_id,
                 "cone_mode_topic": self._cone_mode_topic,
+                "cone_approach_topic": self._cone_approach_topic,
+                "cone_approach_bottom_y_min": self._cone_approach_bottom_y_min,
+                "cone_enter_bottom_y_min": self._cone_enter_bottom_y_min,
                 "signal_preview_topic": (
                     self._signal_preview_topic
                     if self._signal_preview_publisher is not None
                     else None
                 ),
                 "imgsz": list(self._imgsz),
+                "classifier_imgsz": list(self._classifier_imgsz),
                 "image_qos": "best_effort_keep_last_1",
             },
             force_log=True,
         )
+
+    def _warm_models(self) -> None:
+        """Compile both static OpenVINO engines before the first camera frame."""
+
+        detector_dummy = np.zeros((self._imgsz[0], self._imgsz[1], 3), np.uint8)
+        classifier_dummy = np.zeros(
+            (self._classifier_imgsz[0], self._classifier_imgsz[1], 3), np.uint8
+        )
+        detector_results = self._model.predict(
+            source=detector_dummy,
+            imgsz=list(self._imgsz),
+            batch=1,
+            conf=self._conf,
+            iou=self._iou,
+            device=self._device,
+            retina_masks=False,
+            verbose=False,
+        )
+        classifier_results = self._signal_classifier.predict(
+            source=classifier_dummy,
+            imgsz=list(self._classifier_imgsz),
+            batch=1,
+            device=self._device,
+            verbose=False,
+        )
+        if not detector_results or not classifier_results:
+            raise RuntimeError("detector/classifier warm-up returned no result")
 
     def _on_image(self, message: Image) -> None:
         receive_stamp = self.get_clock().now().to_msg()
@@ -533,38 +710,85 @@ class YoloBevNode(Node):
             raise RuntimeError("YOLO returned no Results object")
         result = results[0]
 
-        signals = extract_signal_confidences(
+        traffic_detection = extract_class_detection(
             result,
-            self._signal_ids,
-            min_confidence=self._signal_conf,
-        )
-        signal_detections = extract_signal_detections(
-            result,
-            self._signal_ids,
+            self._traffic_light_id,
             image_hw=(int(bgr.shape[0]), int(bgr.shape[1])),
-            min_confidence=self._signal_conf,
+            min_confidence=self._traffic_light_conf,
         )
-        signal_message = String()
-        signal_message.data = encode_signal_payload(
-            sequence,
-            signals,
-            signal_detections,
-        )
-        self._signal_publisher.publish(signal_message)
-
+        signals: dict[str, float] = {}
+        signal_detections: dict[str, dict[str, float]] = {}
+        classifier_ms = 0.0
+        classifier_ran = False
+        if traffic_detection is not None:
+            try:
+                traffic_crop, _ = crop_normalized_detection(
+                    bgr,
+                    traffic_detection,
+                    padding_ratio=self._traffic_light_crop_padding,
+                    min_size_px=self._traffic_light_crop_min_px,
+                )
+                classifier_started_ns = time.monotonic_ns()
+                classifier_results = self._signal_classifier.predict(
+                    source=traffic_crop,
+                    imgsz=list(self._classifier_imgsz),
+                    batch=1,
+                    device=self._device,
+                    verbose=False,
+                )
+                classifier_ms = (
+                    time.monotonic_ns() - classifier_started_ns
+                ) / 1.0e6
+                if not classifier_results:
+                    raise RuntimeError("traffic classifier returned no result")
+                signals = extract_classifier_probabilities(
+                    classifier_results[0], self._signal_ids
+                )
+                signal_detections = classifier_detections_from_traffic_light(
+                    signals, traffic_detection
+                )
+                classifier_ran = True
+            except Exception as exc:
+                # Lane/mid BEV and START_R must continue even when a bad crop or
+                # classifier failure temporarily removes traffic decisions.
+                self.get_logger().warning(
+                    f"traffic-light classification skipped: {exc}",
+                    throttle_duration_sec=1.0,
+                )
         cone_detection = extract_class_detection(
             result,
             self._cone_trigger_id,
             image_hw=(int(bgr.shape[0]), int(bgr.shape[1])),
             min_confidence=self._cone_trigger_conf,
         )
+        # Raw START_R visibility is intentionally independent of the y2 entry
+        # threshold.  CNN mode logic uses it to suppress cone-shaped LiDAR
+        # clusters from starting OVERTAKE while approaching the cone section.
+        self._start_r_detected_publisher.publish(
+            Bool(data=cone_detection is not None)
+        )
+        cone_approach_ready = bool(
+            cone_detection is not None
+            and cone_detection["y2_norm"] >= self._cone_approach_bottom_y_min
+        )
+        now_sec = time.monotonic()
+        approach_update = self._cone_approach_latch.observe(
+            cone_approach_ready,
+            now_sec=now_sec,
+        )
+        self._cone_approach_publisher.publish(Bool(data=approach_update.active))
+        if approach_update.changed:
+            self.get_logger().info(
+                "START_R approach speed limit changed: %s"
+                % ("ACTIVE" if approach_update.active else "released")
+            )
         cone_enter_ready = bool(
             cone_detection is not None
             and cone_detection["y2_norm"] >= self._cone_enter_bottom_y_min
         )
         cone_update = self._cone_mode_latch.observe(
             cone_enter_ready,
-            now_sec=time.monotonic(),
+            now_sec=now_sec,
         )
         self._cone_mode_publisher.publish(Bool(data=cone_update.active))
         if cone_update.changed:
@@ -572,6 +796,26 @@ class YoloBevNode(Node):
                 "motion mode trigger changed: %s"
                 % ("CONE" if cone_update.active else "NORMAL")
             )
+
+        signal_message = String()
+        signal_message.data = encode_signal_payload(
+            sequence,
+            signals,
+            signal_detections,
+        )
+        self._signal_publisher.publish(signal_message)
+        self._publish_yolo_state(
+            sequence=sequence,
+            image_width=int(bgr.shape[1]),
+            image_height=int(bgr.shape[0]),
+            traffic_detection=traffic_detection,
+            classifier_ran=classifier_ran,
+            cone_detection=cone_detection,
+            approach_ready=cone_approach_ready,
+            approach_latch_active=approach_update.active,
+            enter_ready=cone_enter_ready,
+            latch_active=cone_update.active,
+        )
 
         post_started_ns = time.monotonic_ns()
         lane_native, mid_native = native_lane_mid_unions(
@@ -629,18 +873,23 @@ class YoloBevNode(Node):
                 "backend": self._backend,
                 "decode_ms": round(decode_ms, 3),
                 "queue_ms": round(queue_ms, 3),
-                "inference_ms": round(inference_ms, 3),
+                "detector_ms": round(inference_ms, 3),
+                "classifier_ms": round(classifier_ms, 3),
+                "classifier_ran": classifier_ran,
                 "union_ms": round(union_ms, 3),
                 "remap_ms": round(remap_ms, 3),
                 "total_from_receive_ms": round(total_ms, 3),
                 "mid_cells": int(np.count_nonzero(mid_grid)),
                 "lane_cells": int(np.count_nonzero(lane_grid)),
                 "signals": signals,
+                "traffic_light": traffic_detection,
+                "cone_approach": approach_update.active,
+                "cone_approach_ready": cone_approach_ready,
                 "cone_mode": cone_update.active,
                 "cone_trigger_ready": cone_enter_ready,
                 "cone_trigger": cone_detection,
             },
-            inference_ms,
+            inference_ms + classifier_ms,
             total_ms,
         )
         # Debug JPEG is intentionally generated after the control BEV has been
@@ -650,9 +899,128 @@ class YoloBevNode(Node):
             bgr,
             result,
             signals,
+            traffic_detection=traffic_detection,
+            cone_detection=cone_detection,
             sequence=sequence,
             inference_ms=inference_ms,
             receive_stamp=receive_stamp,
+        )
+
+    def _publish_yolo_state(
+        self,
+        *,
+        sequence: int,
+        image_width: int,
+        image_height: int,
+        traffic_detection: dict[str, float] | None,
+        classifier_ran: bool,
+        cone_detection: dict[str, float] | None,
+        approach_ready: bool,
+        approach_latch_active: bool,
+        enter_ready: bool,
+        latch_active: bool,
+    ) -> None:
+        """Publish viewer-only detector geometry without another inference."""
+
+        publisher = self._yolo_state_publisher
+        if publisher.get_subscription_count() <= 0:
+            return
+        y2_norm = (
+            None if cone_detection is None else float(cone_detection["y2_norm"])
+        )
+        confirm_frames = int(self._cone_mode_latch.enter_confirm_frames)
+        confirm_count = (
+            confirm_frames
+            if latch_active
+            else int(self._cone_mode_latch.enter_streak)
+        )
+        approach_confirm_frames = int(
+            self._cone_approach_latch.enter_confirm_frames
+        )
+        approach_confirm_count = (
+            approach_confirm_frames
+            if approach_latch_active
+            else int(self._cone_approach_latch.enter_streak)
+        )
+        payload = {
+            "schema_version": "yolo_state_v1_gpt",
+            "sequence": int(sequence),
+            "traffic_light": {
+                "detected": traffic_detection is not None,
+                "classifier_ran": bool(classifier_ran),
+                "confidence": (
+                    None
+                    if traffic_detection is None
+                    else float(traffic_detection["confidence"])
+                ),
+                "center_x_norm": (
+                    None
+                    if traffic_detection is None
+                    else float(traffic_detection["center_x_norm"])
+                ),
+                "center_y_norm": (
+                    None
+                    if traffic_detection is None
+                    else float(traffic_detection["center_y_norm"])
+                ),
+                "width_norm": (
+                    None
+                    if traffic_detection is None
+                    else float(traffic_detection["width_norm"])
+                ),
+                "height_norm": (
+                    None
+                    if traffic_detection is None
+                    else float(traffic_detection["height_norm"])
+                ),
+                "center_x_px": (
+                    None
+                    if traffic_detection is None
+                    else float(traffic_detection["center_x_norm"]) * image_width
+                ),
+                "center_y_px": (
+                    None
+                    if traffic_detection is None
+                    else float(traffic_detection["center_y_norm"]) * image_height
+                ),
+            },
+            "start_r": {
+                "class_name": self._cone_trigger_class_name,
+                "detected": cone_detection is not None,
+                "confidence": (
+                    None
+                    if cone_detection is None
+                    else float(cone_detection["confidence"])
+                ),
+                "y2_norm": y2_norm,
+                "y2_px": None if y2_norm is None else y2_norm * image_height,
+                "approach_threshold_norm": float(
+                    self._cone_approach_bottom_y_min
+                ),
+                "approach_threshold_px": (
+                    float(self._cone_approach_bottom_y_min) * image_height
+                ),
+                "approach_ready": bool(approach_ready),
+                "approach_confirm_count": approach_confirm_count,
+                "approach_confirm_frames": approach_confirm_frames,
+                "approach_latch_active": bool(approach_latch_active),
+                "threshold_norm": float(self._cone_enter_bottom_y_min),
+                "threshold_px": float(self._cone_enter_bottom_y_min) * image_height,
+                "enter_ready": bool(enter_ready),
+                "confirm_count": confirm_count,
+                "confirm_frames": confirm_frames,
+                "latch_active": bool(latch_active),
+            },
+        }
+        publisher.publish(
+            String(
+                data=json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
         )
 
     def _publish_signal_preview_frame(
@@ -661,6 +1029,8 @@ class YoloBevNode(Node):
         result: Any,
         signals: dict[str, float],
         *,
+        traffic_detection: dict[str, float] | None,
+        cone_detection: dict[str, float] | None,
         sequence: int,
         inference_ms: float,
         receive_stamp: Any,
@@ -671,8 +1041,11 @@ class YoloBevNode(Node):
         view = make_signal_preview(
             bgr,
             result,
-            self._signal_ids,
+            self._traffic_light_id,
             signals,
+            traffic_detection=traffic_detection,
+            cone_trigger_id=self._cone_trigger_id,
+            cone_detection=cone_detection,
             sequence=sequence,
             inference_ms=inference_ms,
             output_width=self._signal_preview_width,

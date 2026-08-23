@@ -27,7 +27,9 @@ def generate_launch_description():
     enable_sensors = LaunchConfiguration("enable_sensors")
     enable_lidar = LaunchConfiguration("enable_lidar")
     enable_motion = LaunchConfiguration("enable_motion")
+    enable_viewer = LaunchConfiguration("enable_viewer")
     show_viewer = LaunchConfiguration("show_viewer")
+    viewer_publish_compressed = LaunchConfiguration("viewer_publish_compressed")
     ros_domain_id = LaunchConfiguration("ros_domain_id")
     speed_cap = LaunchConfiguration("speed_cap")
 
@@ -36,7 +38,11 @@ def generate_launch_description():
             DeclareLaunchArgument("enable_sensors", default_value="true"),
             DeclareLaunchArgument("enable_lidar", default_value=enable_sensors),
             DeclareLaunchArgument("enable_motion", default_value="true"),
+            DeclareLaunchArgument("enable_viewer", default_value="true"),
             DeclareLaunchArgument("show_viewer", default_value="true"),
+            DeclareLaunchArgument(
+                "viewer_publish_compressed", default_value="false"
+            ),
             DeclareLaunchArgument("ros_domain_id", default_value="7"),
             DeclareLaunchArgument("speed_cap", default_value="5.0"),
             SetEnvironmentVariable("FASTRTPS_DEFAULT_PROFILES_FILE", dds_profile),
@@ -82,7 +88,10 @@ def generate_launch_description():
                     perception_config,
                     {
                         "enable_drive": True,
-                        "initial_manual_go": True,
+                        # Exercise the same WAIT_GREEN -> RUNNING lifecycle as
+                        # the real drive launches.  /manual_go remains an
+                        # explicit operator override when needed.
+                        "initial_manual_go": False,
                         "speed_cap": ParameterValue(speed_cap, value_type=float),
                     },
                 ],
@@ -108,9 +117,15 @@ def generate_launch_description():
                 package="track_drive_cnn_gpt",
                 executable="live_pipeline_viewer",
                 output="screen",
+                condition=IfCondition(enable_viewer),
                 parameters=[
                     perception_config,
-                    {"show_window": ParameterValue(show_viewer, value_type=bool)},
+                    {
+                        "show_window": ParameterValue(show_viewer, value_type=bool),
+                        "publish_compressed": ParameterValue(
+                            viewer_publish_compressed, value_type=bool
+                        ),
+                    },
                 ],
             ),
         ]

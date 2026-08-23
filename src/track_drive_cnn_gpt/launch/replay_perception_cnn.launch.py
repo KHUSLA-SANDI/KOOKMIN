@@ -16,6 +16,7 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -34,12 +35,20 @@ def generate_launch_description():
     exit_when_done = LaunchConfiguration("exit_when_done")
     enable_yolo = LaunchConfiguration("enable_yolo")
     enable_cnn = LaunchConfiguration("enable_cnn")
+    enable_viewer = LaunchConfiguration("enable_viewer")
+    viewer_show_window = LaunchConfiguration("viewer_show_window")
+    viewer_publish_compressed = LaunchConfiguration("viewer_publish_compressed")
     record_output = LaunchConfiguration("record_output")
     record_preview = LaunchConfiguration("record_preview")
     output_jsonl = LaunchConfiguration("output_jsonl")
     output_preview = LaunchConfiguration("output_preview")
     yolo_model_path = LaunchConfiguration("yolo_model_path")
     cnn_model_path = LaunchConfiguration("cnn_model_path")
+    general_model_path = LaunchConfiguration("general_model_path")
+    shortcut_model_path = LaunchConfiguration("shortcut_model_path")
+    overtake_model_path = LaunchConfiguration("overtake_model_path")
+    cone_model_path = LaunchConfiguration("cone_model_path")
+    camera_yaml = LaunchConfiguration("camera_yaml")
     ros_domain_id = LaunchConfiguration("ros_domain_id")
 
     replay_node = Node(
@@ -72,6 +81,9 @@ def generate_launch_description():
         DeclareLaunchArgument("exit_when_done", default_value="false"),
         DeclareLaunchArgument("enable_yolo", default_value="true"),
         DeclareLaunchArgument("enable_cnn", default_value="true"),
+        DeclareLaunchArgument("enable_viewer", default_value="false"),
+        DeclareLaunchArgument("viewer_show_window", default_value="false"),
+        DeclareLaunchArgument("viewer_publish_compressed", default_value="false"),
         DeclareLaunchArgument("record_output", default_value="true"),
         # MP4 encoding consumes CPU, so leave it off for latency benchmarks.
         DeclareLaunchArgument("record_preview", default_value="false"),
@@ -89,6 +101,26 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "cnn_model_path",
             default_value="/home/xytron/xycar_ws/models/path_cnn.pt",
+        ),
+        DeclareLaunchArgument(
+            "general_model_path",
+            default_value="/home/xytron/xycar_ws/models/general_single_best_gpt.pt",
+        ),
+        DeclareLaunchArgument(
+            "shortcut_model_path",
+            default_value="/home/xytron/xycar_ws/models/left_shortcut_single_best_gpt.pt",
+        ),
+        DeclareLaunchArgument(
+            "overtake_model_path",
+            default_value="/home/xytron/xycar_ws/models/obstacle_single_best_gpt.pt",
+        ),
+        DeclareLaunchArgument(
+            "cone_model_path",
+            default_value="/home/xytron/xycar_ws/models/cone_single_all967_final_gpt.pt",
+        ),
+        DeclareLaunchArgument(
+            "camera_yaml",
+            default_value=os.path.join(package_share, "config", "camera.yaml"),
         ),
         # Isolate replay from normal live domain 7 unless explicitly overridden.
         DeclareLaunchArgument("ros_domain_id", default_value="17"),
@@ -110,6 +142,7 @@ def generate_launch_description():
             condition=IfCondition(enable_yolo),
             parameters=[perception_config, {
                 "model_path": yolo_model_path,
+                "camera_yaml": camera_yaml,
                 # More windows make the short replay latency summary useful.
                 "diag_period_sec": 0.5,
             }],
@@ -119,7 +152,28 @@ def generate_launch_description():
             executable="cnn_path",
             output="screen",
             condition=IfCondition(enable_cnn),
-            parameters=[perception_config, {"model_path": cnn_model_path}],
+            parameters=[perception_config, {
+                # Keep the old single-model override for backward-compatible
+                # checkpoints, while exposing the four production models that
+                # take precedence in the current node.
+                "model_path": cnn_model_path,
+                "general_model_path": general_model_path,
+                "shortcut_model_path": shortcut_model_path,
+                "overtake_model_path": overtake_model_path,
+                "cone_model_path": cone_model_path,
+            }],
+        ),
+        Node(
+            package="track_drive_cnn_gpt",
+            executable="live_pipeline_viewer",
+            output="screen",
+            condition=IfCondition(enable_viewer),
+            parameters=[perception_config, {
+                "show_window": ParameterValue(viewer_show_window, value_type=bool),
+                "publish_compressed": ParameterValue(
+                    viewer_publish_compressed, value_type=bool
+                ),
+            }],
         ),
         Node(
             package="track_drive_cnn_gpt",

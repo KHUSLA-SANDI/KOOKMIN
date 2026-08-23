@@ -1,34 +1,87 @@
 motion_node:
   ros__parameters:
-    # GENERAL 구간 튜닝값. 실제 목표 속도도 이 파일이 소유한다.
-    lookahead_m: 1.0
-    steer_gain: 1.0
+    # =====================================================================
+    # 현장 튜닝표: 각 MODE마다 아래 네 값만 수정한다.
+    #
+    # *_steer_gain
+    #   실차 권장 범위: 0.8~1.8 (빠른 탐색 0.1, 미세조정 0.05)
+    #   2.0 이상은 큰 오차에서 최대 조향/경로 노이즈에 빨리 걸릴 수 있음
+    #   증가: 같은 경로 오차에서 더 많이 꺾음
+    #   감소: 덜 꺾음. 안쪽 과진입/좌우 진동 때 감소
+    # *_lookahead_m
+    #   실차 권장 범위: 일반 0.8~1.4m / 라바콘 0.6~1.1m
+    #   작은 오차에서 반응성은 대략 steer_gain/lookahead_m에 비례함
+    #   감소: 가까운 경로를 보고 더 빠르고 날카롭게 반응
+    #   증가: 먼 경로를 보고 더 부드럽게 반응
+    # *_steer_smooth_alpha
+    #   실차 권장 범위: 0.25~0.65 (0.2 이하는 느림, 0.7 이상은 거의 무필터)
+    #   증가(최대 1.0): 목표 조향을 더 빨리 따라감
+    #   감소: 더 부드럽지만 반응이 느려짐
+    # *_speed_cmd
+    #   실차 보수 시작 범위: 라바콘 4~8 / 일반 5~18
+    #   차량 데드존 때문에 4 미만은 속도 미세조정 의미가 거의 없음
+    #   해당 MODE 목표속도. 실제 명령은 min(speed_cmd, speed_cap)
+    #
+    # 권장 조정폭: gain 0.05 / lookahead 0.1m / alpha 0.05
+    # 라바콘 현장 순서:
+    #   speed=4, lookahead=0.9, alpha=0.40 고정
+    #   -> gain 1.2, 1.4, 1.6, 1.8 순서로 비교
+    #   -> 그래도 늦게 껍으면 lookahead 0.9 -> 0.8
+    #   -> 진동하면 gain -0.1 또는 alpha 0.40 -> 0.35
+    # =====================================================================
+
+    # ------------------------- GENERAL 일반주행 --------------------------
+    lookahead_m: 1.1
+    steer_gain: 1.35
     steer_smooth_alpha: 0.40
-    speed_cmd: 5.0
+    speed_cmd: 16.0
 
-    # 전용 CNN이 도착하기 전에는 경로 모델과 motion 값 모두 GENERAL과 같다.
-    # 이후 아래 숫자와 checkpoint 경로만 독립적으로 교체한다.
-    shortcut_lookahead_m: 1.0
-    shortcut_steer_gain: 1.0
+    # ------------------------ SHORTCUT 지름길 ----------------------------
+    shortcut_lookahead_m: 1.1
+    shortcut_steer_gain: 1.35
     shortcut_steer_smooth_alpha: 0.40
-    shortcut_speed_cmd: 5.0
+    shortcut_speed_cmd: 16.0
 
-    overtake_lookahead_m: 1.0
-    overtake_steer_gain: 1.0
+    # ------------------------- OVERTAKE 추월 -----------------------------
+    # OVERTAKE 전체 유지시간 동안 이 단일 lookahead를 사용한다.
+    overtake_lookahead_m: 0.8
+    overtake_steer_gain: 1.35
     overtake_steer_smooth_alpha: 0.40
-    overtake_speed_cmd: 5.0
+    overtake_speed_cmd: 14.0
 
-    # CONE 구간 임시 시작값. 새 trigger 모델과 현장 주행을 보고 확정한다.
-    cone_lookahead_m: 0.8
-    cone_steer_gain: 0.55
-    cone_steer_smooth_alpha: 0.35
-    cone_speed_cmd: 3.5
+    # --------------------------- CONE 라바콘 -----------------------------
+    # 내일 우선순위: 낮은 speed 고정 -> gain -> lookahead -> alpha -> speed
+    cone_lookahead_m: 0.85
+    cone_steer_gain: 1.35
+    cone_steer_smooth_alpha: 0.40
+    cone_speed_cmd: 8.0
+
+    # --------------------- START_R 접근 선감속 ---------------------------
+    # CNN/MODE는 GENERAL 그대로 두고 속도만 잠시 이 값으로 제한한다.
+    # 시작 y2 좌표는 perception_cnn.yaml의 cone_approach_bottom_y_min.
+    cone_approach_topic: "/perception/cone_approach"
+    cone_approach_speed_cmd: 12.0
+
+    # --------------------- 모터 기동/가감속 램프 ------------------------
+    # /xycar_motor 발행은 control_hz(20Hz)로 계속 유지한다.
+    # 실차 지상 측정(2026-08-23): 0에서 틱마다 +0.25씩 직접 증가.
+    # 20Hz 기준 0 -> 12에 약 2.4초. 최저 8.3V, 피크 12.62A, VESC fault=0.
+    # +0.5/tick은 15.34A까지 올라 상한에 너무 가까워 사용하지 않는다.
+    # 주행 중 모드 전환(예: GENERAL 12 -> 접근 8 -> CONE 6)은 기동단계를
+    # 다시 시작하지 않고 틱마다 -2.0씩 새 목표속도로 접근한다.
+    # manual_go=false 등 STOP 명령은 램프 없이 그 틱에 바로 0을 발행한다.
+    startup_speed_cmd: 0.0
+    startup_hold_sec: 0.0
+    slew_speed_up_per_tick: 0.25
+    slew_speed_down_per_tick: 2.0
+
+    # ------------------------ 아래는 수정하지 않음 -----------------------
     cnn_mode_topic: "/cnn_mode"
-
-    # 아래는 튜닝 기능이 아니라 입력·안전 계약이다.
     control_hz: 20.0
+    # 새 경로를 받아들일 때의 timestamp 검사값이다. 이 시간이 지나거나
+    # 빈 경로가 들어와도 정지하지 않고 마지막 정상 경로/조향을 계속 쓴다.
     path_stale_sec: 1.0
     path_future_tolerance_sec: 0.05
     path_frame_id: "lidar_frame"
-    expected_car_interface_sha256: "6554c716957cc93eb77b626bca3554653708b130640a6860da55d8811b889091"
+    expected_car_interface_sha256: "595628d4c08bed8ddc59ad7e53bd5393084256f74b80815994544f957935d9f8"
     verify_car_interface_source: true
