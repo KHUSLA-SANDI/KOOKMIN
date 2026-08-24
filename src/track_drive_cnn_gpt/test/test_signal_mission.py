@@ -260,17 +260,14 @@ def test_left_selects_shortcut_for_ten_seconds_without_refreshing_each_frame():
     mission = TrafficMissionController(
         confirm_frames=2, confidence=0.25, shortcut_hold_sec=10.0
     )
-    mission.observe(1, {"LEFT": 0.9}, {"LEFT": _box()}, now_sec=100.0)
-    second = mission.observe(
-        2, {"LEFT": 0.9}, {"LEFT": _box()}, now_sec=100.1
-    )
-    assert second.route_changed
+    first = mission.observe(1, {"LEFT": 0.9}, {"LEFT": _box()}, now_sec=100.0)
+    assert first.route_changed
     assert mission.route_intent(109.99) == ROUTE_SHORTCUT
 
     # Continuous LEFT observations must not keep moving the ten-second end.
     mission.observe(3, {"LEFT": 0.9}, {"LEFT": _box()}, now_sec=105.0)
-    assert mission.route_intent(110.09) == ROUTE_SHORTCUT
-    assert mission.route_intent(110.11) == ROUTE_MAIN
+    assert mission.route_intent(109.99) == ROUTE_SHORTCUT
+    assert mission.route_intent(110.01) == ROUTE_MAIN
 
 
 def test_far_left_waits_until_the_stop_line_decision_zone():
@@ -287,24 +284,21 @@ def test_far_left_waits_until_the_stop_line_decision_zone():
     assert mission.route_intent(1.1) == ROUTE_MAIN
 
     close_left = {"LEFT": _box(center_y=0.18, width=0.12)}
-    mission.observe(3, {"LEFT": 0.9}, close_left, now_sec=1.2)
-    entered = mission.observe(4, {"LEFT": 0.9}, close_left, now_sec=1.3)
+    entered = mission.observe(3, {"LEFT": 0.9}, close_left, now_sec=1.2)
     assert entered.decision_zone
     assert entered.route_changed
-    assert mission.route_intent(1.3) == ROUTE_SHORTCUT
+    assert mission.route_intent(1.2) == ROUTE_SHORTCUT
 
 
-def test_left_confirmation_allows_one_short_gap_inside_time_window():
+def test_one_left_in_decision_zone_latches_immediately():
     mission = TrafficMissionController(
         confirm_frames=2,
         shortcut_hold_sec=10.0,
         left_confirm_window_sec=1.5,
     )
-    mission.observe(1, {"LEFT": 0.9}, {"LEFT": _box()}, now_sec=1.0)
-    mission.observe(2, {"GREEN": 0.9}, {"GREEN": _box()}, now_sec=1.4)
-    update = mission.observe(3, {"LEFT": 0.9}, {"LEFT": _box()}, now_sec=2.0)
+    update = mission.observe(1, {"LEFT": 0.9}, {"LEFT": _box()}, now_sec=1.0)
     assert update.route_changed
-    assert mission.route_intent(2.0) == ROUTE_SHORTCUT
+    assert mission.route_intent(1.0) == ROUTE_SHORTCUT
 
 
 @pytest.mark.parametrize("stop_name", ["RED", "YELLOW"])
@@ -338,13 +332,14 @@ def test_red_yellow_only_stop_in_position_and_near_green_releases(stop_name):
     assert not mission.traffic_stop
 
 
-def test_duplicate_sequence_does_not_confirm_stop_or_left():
+def test_duplicate_sequence_does_not_refresh_one_hit_left_latch():
     mission = TrafficMissionController(confirm_frames=2)
     left = {"LEFT": _box()}
-    mission.observe(8, {"LEFT": 0.9}, left, now_sec=10.0)
+    first = mission.observe(8, {"LEFT": 0.9}, left, now_sec=10.0)
+    assert first.route_changed
     duplicate = mission.observe(8, {"LEFT": 0.9}, left, now_sec=10.1)
     assert not duplicate.accepted
-    assert mission.route_intent(10.1) == ROUTE_MAIN
+    assert mission.route_intent(10.1) == ROUTE_SHORTCUT
 
 
 def test_timed_trigger_confirms_entry_and_holds_exit_for_one_second():
@@ -357,18 +352,17 @@ def test_timed_trigger_confirms_entry_and_holds_exit_for_one_second():
     assert not exited.active and exited.changed
 
 
-def test_confirmed_green_at_decision_line_forces_main_and_go():
+def test_confirmed_green_does_not_cancel_one_hit_left_route():
     mission = TrafficMissionController(confirm_frames=2, shortcut_hold_sec=10.0)
     left = {"LEFT": _box(center_y=0.18, width=0.12)}
     mission.observe(1, {"LEFT": 0.9}, left, now_sec=1.0)
-    mission.observe(2, {"LEFT": 0.9}, left, now_sec=1.1)
-    assert mission.route_intent(1.2) == ROUTE_SHORTCUT
+    assert mission.route_intent(1.1) == ROUTE_SHORTCUT
 
     green = {"GREEN": _box(center_y=0.18, width=0.12)}
     mission.observe(3, {"GREEN": 0.9}, green, now_sec=1.3)
     update = mission.observe(4, {"GREEN": 0.9}, green, now_sec=1.4)
-    assert update.route_changed
-    assert mission.route_intent(1.4) == ROUTE_MAIN
+    assert not update.route_changed
+    assert mission.route_intent(1.4) == ROUTE_SHORTCUT
     assert not mission.traffic_stop
 
 

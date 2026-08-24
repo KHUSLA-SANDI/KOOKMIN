@@ -754,9 +754,10 @@ class TrafficMissionController:
     """Sequence-aware timed shortcut and stop-line signal controller.
 
     Every traffic action is gated by the configured stop-line image zone.
-    Confirmed LEFT in that zone starts one fixed-duration shortcut window,
-    while RED/YELLOW latch a stop.  Once stopped, confirmed GREEN or LEFT in
-    that same zone releases the stop; detection loss alone never releases it.
+    One LEFT observation in that zone starts one fixed-duration shortcut
+    window.  RED/YELLOW still latch a stop and confirmed GREEN or LEFT in the
+    same zone releases it, but those later signals do not cancel an already
+    latched shortcut route.
     """
 
     def __init__(
@@ -879,22 +880,16 @@ class TrafficMissionController:
         # A far-away LEFT remains visible in diagnostics/viewer, but it must
         # not start the shortcut timer before the stop-line decision point.
         left_seen = dominant == "LEFT" and decision_zone
-        oldest_left_hit = now - self.left_confirm_window_sec
-        self._left_hit_times = [
-            timestamp
-            for timestamp in self._left_hit_times
-            if timestamp >= oldest_left_hit
-        ]
         if left_seen:
             self._left_absent_streak = 0
             if self._left_armed and before_route != ROUTE_SHORTCUT:
-                self._left_hit_times.append(now)
-                self.left_streak = len(self._left_hit_times)
-                if self.left_streak >= self.confirm_frames:
-                    self._shortcut_until = now + self.shortcut_hold_sec
-                    self._left_armed = False
-                    self.left_streak = 0
-                    self._left_hit_times.clear()
+                # Competition rule: one LEFT classification in the signal
+                # decision zone has priority over later straight/GREEN
+                # classifications for this fixed shortcut window.
+                self._shortcut_until = now + self.shortcut_hold_sec
+                self._left_armed = False
+                self.left_streak = 0
+                self._left_hit_times.clear()
         else:
             self.left_streak = len(self._left_hit_times)
             self._left_absent_streak += 1
@@ -913,10 +908,8 @@ class TrafficMissionController:
                 self._decision_streak = 1
             if self._decision_streak >= self.confirm_frames:
                 if decision_name in ("RED", "YELLOW"):
-                    self._shortcut_until = -math.inf
                     self.traffic_stop = True
                 elif decision_name == "GREEN":
-                    self._shortcut_until = -math.inf
                     self.traffic_stop = False
                 elif decision_name == "LEFT":
                     self.traffic_stop = False

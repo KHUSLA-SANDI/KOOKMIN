@@ -7,9 +7,9 @@ yolo_bev_node:
     # 배포 시 실제 install 경로로 바꾼다. OpenVINO 검증 후에는 *_openvino_model 폴더.
     model_path: "/home/xytron/xycar_ws/models/traffic_detector_seg_best_openvino_model" # lane/mid/START_R/traffic_light 검출
     expected_model_sha256: "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59" # 검출 원본 PT 무결성
-    classifier_model_path: "/home/xytron/xycar_ws/models/yolo11n_cls_best_openvino_model" # 신호등 2차 crop 4분류
-    classifier_expected_model_sha256: "2c16877f7fe43231ae08ccbfce6c8a9388d17aeb50a01dc21f6359f925f8e959" # 분류 원본 PT 무결성
-    classifier_imgsz: [320, 320]                # 분류기 정적 OpenVINO 입력 H,W
+    classifier_model_path: "/home/xytron/xycar_ws/models/traffic_light_cls_best_openvino_model" # V1 신호등 2차 crop 4분류
+    classifier_expected_model_sha256: "5bb0e96f38977a98d7a7d336a8d4a0b40cb91f3a0c58b03ce947c84b163b1287" # V1 분류 원본 PT 무결성
+    classifier_imgsz: [224, 224]                # V1 분류기 정적 OpenVINO 입력 H,W
     traffic_light_class_name: "traffic_light"  # 이 박스가 있을 때만 분류 실행
     traffic_light_conf: 0.25                    # 신호등 박스 최소 검출 confidence
     traffic_light_crop_padding: 0.12            # 박스 둘레 12% 여백을 포함해 분류
@@ -72,7 +72,7 @@ cnn_path_node:
     # [현장 수정 B] 모드 진입 확인 및 유지시간
     # 같은 trigger가 반복돼도 이미 시작된 타이머는 연장되지 않는다.
     # =====================================================================
-    left_confirm_frames: 2           # LEFT 및 정지선 신호 연속 확인 횟수
+    left_confirm_frames: 2           # RED/YELLOW/GREEN 정지선 판단 연속 확인 횟수(LEFT 경로는 1회 즉시 래치)
     left_confidence: 0.25            # LEFT 최소 confidence
     shortcut_hold_sec: 13.0          # SHORTCUT 유지시간
     overtake_hold_sec: 3.0           # OVERTAKE 단일 프로필 유지시간
@@ -87,7 +87,7 @@ cnn_path_node:
     obstacle_lane_deadband_m: 0.10
     # CONE 타이머의 실제 만료시각부터 계산. route reset은 이 창을 켜지 않음.
     post_cone_hardcode_window_sec: 5.0
-    left_confirm_window_sec: 1.5     # 이 시간 안에 LEFT 2회 필요
+    left_confirm_window_sec: 1.5     # 호환용 기존 값(현재 LEFT 경로는 신호구간 1회로 즉시 래치)
     left_rearm_absent_frames: 3      # LEFT 재무장에 필요한 미검출 프레임
 
     # =====================================================================
