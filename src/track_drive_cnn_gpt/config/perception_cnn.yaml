@@ -7,9 +7,9 @@ yolo_bev_node:
     # 배포 시 실제 install 경로로 바꾼다. OpenVINO 검증 후에는 *_openvino_model 폴더.
     model_path: "/home/xytron/xycar_ws/models/traffic_detector_seg_best_openvino_model" # lane/mid/START_R/traffic_light 검출
     expected_model_sha256: "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59" # 검출 원본 PT 무결성
-    classifier_model_path: "/home/xytron/xycar_ws/models/yolo11s_cls_best_v2_openvino_model" # V2 신호등 crop 4분류
-    classifier_expected_model_sha256: "87ac68859af279e6d153334b7c90fb27b3ed221481bda2fc68e11c7bfeab16e0" # V2 분류 원본 PT 무결성
-    classifier_imgsz: [320, 320]                # V2 분류기 정적 OpenVINO 입력 H,W
+    classifier_model_path: "/home/xytron/xycar_ws/models/yolo11n_cls_best_openvino_model" # 신호등 2차 crop 4분류
+    classifier_expected_model_sha256: "2c16877f7fe43231ae08ccbfce6c8a9388d17aeb50a01dc21f6359f925f8e959" # 분류 원본 PT 무결성
+    classifier_imgsz: [320, 320]                # 분류기 정적 OpenVINO 입력 H,W
     traffic_light_class_name: "traffic_light"  # 이 박스가 있을 때만 분류 실행
     traffic_light_conf: 0.25                    # 신호등 박스 최소 검출 confidence
     traffic_light_crop_padding: 0.12            # 박스 둘레 12% 여백을 포함해 분류
@@ -106,9 +106,9 @@ cnn_path_node:
     # 않는다. 출발은 LAP=0이다. 이후 같은 정지선에 다시 도착할 때마다
     # 박스 중심/폭 조건을 적용해 1랩으로 세며, 같은 통과의 반복 검출은 아래
     # 재무장 프레임과 10초 쿨타임을 모두 만족해야 다시 셀 수 있다.
-    # 연습에서 계속 돌 때는 race_finish_enabled만 false로 바꾼다.
+    # 3바퀴 자동 정지는 사용하지 않는다. 신호등 STOP/GO 판단은 유지한다.
     # =====================================================================
-    race_finish_enabled: true          # true: 목표 랩에서 정지, false: 계속 주행
+    race_finish_enabled: false         # false: 랩 수와 무관하게 계속 주행
     race_target_laps: 3                # 완주로 판단할 랩 수
     race_lap_cooldown_sec: 10.0        # 한 바퀴보다 짧은 중복 인식 차단시간(s)
     race_lap_clear_frames: 5           # 정지선 zone 이탈 연속 프레임 후 재무장

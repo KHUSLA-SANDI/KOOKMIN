@@ -237,7 +237,7 @@ def test_drive_gate_requires_source_frame_and_timestamp_policy():
         (ROOT / "config" / "perception_cnn.yaml").read_text(encoding="utf-8")
     )["cnn_path_node"]["ros__parameters"]
     assert cnn["race_go_topic"] == "/race_go"
-    assert cnn["race_finish_enabled"] is True
+    assert cnn["race_finish_enabled"] is False
     assert cnn["race_target_laps"] == 3
     assert cnn["race_lap_cooldown_sec"] == pytest.approx(10.0)
     assert cnn["race_lap_clear_frames"] == 5
@@ -263,10 +263,10 @@ def test_rectangular_openvino_and_direct_signal_selection_are_configured():
         "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59"
     )
     assert yolo["classifier_model_path"].endswith(
-        "/yolo11s_cls_best_v2_openvino_model"
+        "/yolo11n_cls_best_openvino_model"
     )
     assert yolo["classifier_expected_model_sha256"] == (
-        "87ac68859af279e6d153334b7c90fb27b3ed221481bda2fc68e11c7bfeab16e0"
+        "2c16877f7fe43231ae08ccbfce6c8a9388d17aeb50a01dc21f6359f925f8e959"
     )
     assert yolo["classifier_imgsz"] == [320, 320]
     assert yolo["traffic_light_class_name"] == "traffic_light"

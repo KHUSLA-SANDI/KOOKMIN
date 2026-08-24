@@ -53,7 +53,7 @@ DETECTOR_SOURCE_SHA256 = (
     "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59"
 )
 CLASSIFIER_SOURCE_SHA256 = (
-    "87ac68859af279e6d153334b7c90fb27b3ed221481bda2fc68e11c7bfeab16e0"
+    "2c16877f7fe43231ae08ccbfce6c8a9388d17aeb50a01dc21f6359f925f8e959"
 )
 
 
@@ -297,7 +297,7 @@ class YoloBevNode(Node):
         )
         self.declare_parameter(
             "classifier_model_path",
-            "/home/xytron/xycar_ws/models/yolo11s_cls_best_v2_openvino_model",
+            "/home/xytron/xycar_ws/models/yolo11n_cls_best_openvino_model",
         )
         self.declare_parameter(
             "classifier_expected_model_sha256", CLASSIFIER_SOURCE_SHA256
