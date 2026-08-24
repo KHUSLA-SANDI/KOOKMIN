@@ -51,7 +51,7 @@ motion_node:
 
     # ---------------- V3/V4 배타적 하드코딩 블록 -----------------------
     # cnn_path_node와 반드시 같은 값. V3=hardcoded_all, V4=hardcoded_post_cone.
-    overtake_strategy: "hardcoded_all"
+    overtake_strategy: "hardcoded_post_cone"
     overtake_block_request_topic: "/motion/overtake_block_request"
     # 요청을 받으면 다음 20Hz 제어 틱에서 즉시 SHIFT를 시작한다.
     # 속도는 대기하지 않고 기존 slew가 블록과 동시에 16으로 접근한다.

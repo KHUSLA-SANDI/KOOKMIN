@@ -77,7 +77,7 @@ def test_runtime_grid_config_is_the_frozen_contract():
     assert params["overtake_inward_margin_m"] == 0.10
     assert params["overtake_x_min_m"] == 0.0
     assert params["overtake_x_max_m"] == 1.40
-    assert params["overtake_strategy"] == "hardcoded_all"
+    assert params["overtake_strategy"] == "hardcoded_post_cone"
     assert params["overtake_block_request_topic"] == (
         "/motion/overtake_block_request"
     )
@@ -162,7 +162,7 @@ def test_simple_motion_has_four_independent_profiles():
     assert config["cone_approach_speed_cmd"] == 12.0
     assert config["control_hz"] == 20.0
     assert config["debug_hz"] == 10.0
-    assert config["overtake_strategy"] == "hardcoded_all"
+    assert config["overtake_strategy"] == "hardcoded_post_cone"
     assert config["overtake_block_request_topic"] == (
         "/motion/overtake_block_request"
     )

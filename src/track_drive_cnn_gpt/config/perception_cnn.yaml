@@ -81,7 +81,7 @@ cnn_path_node:
     # ---------------- V3/V4 장애물 실행 전략 ---------------------------
     # hardcoded_all: 모든 유효 장애물을 차선별 고정 조향 블록으로 회피(V3)
     # hardcoded_post_cone: CONE 자연 종료 뒤 5초만 고정 블록, 그 밖은 CNN(V4)
-    overtake_strategy: "hardcoded_all"
+    overtake_strategy: "hardcoded_post_cone"
     overtake_block_request_topic: "/motion/overtake_block_request"
     # yellow/mid 기준 lateral offset 절댓값이 이보다 작으면 좌/우 UNKNOWN.
     obstacle_lane_deadband_m: 0.10
