@@ -49,6 +49,26 @@ motion_node:
     overtake_steer_smooth_alpha: 0.40
     overtake_speed_cmd: 14.0
 
+    # ---------------- V3/V4 배타적 하드코딩 블록 -----------------------
+    # cnn_path_node와 반드시 같은 값. V3=hardcoded_all, V4=hardcoded_post_cone.
+    overtake_strategy: "hardcoded_all"
+    overtake_block_request_topic: "/motion/overtake_block_request"
+    # 요청을 받으면 다음 20Hz 제어 틱에서 즉시 SHIFT를 시작한다.
+    # 속도는 대기하지 않고 기존 slew가 블록과 동시에 16으로 접근한다.
+    hardcoded_block_lane_change_speed_cmd: 16.0
+    hardcoded_block_pass_speed_cmd: 16.0
+    hardcoded_block_pass_ticks: 20
+    # 장애물이 1차선(왼쪽, +offset): 차량은 오른쪽으로 이동.
+    hardcoded_block_right_shift_angle_cmd: 60.0
+    hardcoded_block_right_shift_ticks: 6
+    hardcoded_block_right_counter_angle_cmd: -60.0
+    hardcoded_block_right_counter_ticks: 10
+    # 장애물이 2차선(오른쪽, -offset): 차량은 왼쪽으로 이동.
+    hardcoded_block_left_shift_angle_cmd: -60.0
+    hardcoded_block_left_shift_ticks: 7
+    hardcoded_block_left_counter_angle_cmd: 60.0
+    hardcoded_block_left_counter_ticks: 10
+
     # --------------------------- CONE 라바콘 -----------------------------
     # 내일 우선순위: 낮은 speed 고정 -> gain -> lookahead -> alpha -> speed
     cone_lookahead_m: 0.85
@@ -78,6 +98,8 @@ motion_node:
     # ------------------------ 아래는 수정하지 않음 -----------------------
     cnn_mode_topic: "/cnn_mode"
     control_hz: 20.0
+    # 6틱 SHIFT는 0.3초이므로 viewer가 놓치지 않게 상태를 10Hz로 발행.
+    debug_hz: 10.0
     # 새 경로를 받아들일 때의 timestamp 검사값이다. 이 시간이 지나거나
     # 빈 경로가 들어와도 정지하지 않고 마지막 정상 경로/조향을 계속 쓴다.
     path_stale_sec: 1.0

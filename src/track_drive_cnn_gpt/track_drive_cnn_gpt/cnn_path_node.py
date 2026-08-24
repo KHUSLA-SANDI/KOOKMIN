@@ -40,6 +40,17 @@ from .cnn_modes import (
     CnnModeController,
     ConfirmedOneShot,
 )
+from .hardcoded_overtake import (
+    OBSTACLE_UNKNOWN,
+    OVERTAKE_STRATEGIES,
+    STRATEGY_HARDCODED_ALL,
+    STRATEGY_HARDCODED_POST_CONE,
+    DirectionalConfirmedOneShot,
+    HardcodedOvertakeRequest,
+    PostConeHardcodeWindow,
+    avoidance_direction,
+    classify_obstacle_lane,
+)
 from .lidar_geometry import (
     GRID_H,
     GRID_W,
@@ -125,6 +136,22 @@ class CnnPathNode(Node):
         )
         self._mode_topic = str(p("cnn_mode_topic", "/cnn_mode"))
         self._cone_mode_topic = str(p("cone_mode_topic", "/cone_mode"))
+        self._overtake_strategy = str(
+            p("overtake_strategy", STRATEGY_HARDCODED_ALL)
+        ).strip().lower()
+        if self._overtake_strategy not in OVERTAKE_STRATEGIES:
+            raise ValueError(
+                "overtake_strategy must be hardcoded_all or hardcoded_post_cone"
+            )
+        self._overtake_block_request_topic = str(
+            p("overtake_block_request_topic", "/motion/overtake_block_request")
+        )
+        self._obstacle_lane_deadband = float(
+            p("obstacle_lane_deadband_m", 0.10)
+        )
+        self._post_cone_hardcode_window_sec = float(
+            p("post_cone_hardcode_window_sec", 5.0)
+        )
         self._enable_center_path = bool(p("enable_center_path", True))
         shortcut_hold_sec = float(p("shortcut_hold_sec", 10.0))
         overtake_hold_sec = float(p("overtake_hold_sec", 7.0))
@@ -165,15 +192,29 @@ class CnnPathNode(Node):
             overtake_hold_sec=overtake_hold_sec,
             cone_hold_sec=cone_hold_sec,
         )
-        self._overtake_latch = ConfirmedOneShot(
-            confirm_frames=int(p("overtake_confirm_frames", 2)),
-            rearm_clear_frames=int(p("overtake_rearm_clear_frames", 5)),
+        overtake_confirm_frames = int(p("overtake_confirm_frames", 2))
+        overtake_rearm_frames = int(p("overtake_rearm_clear_frames", 5))
+        self._overtake_direction_latch = DirectionalConfirmedOneShot(
+            confirm_frames=overtake_confirm_frames,
+            rearm_clear_frames=overtake_rearm_frames,
         )
+        self._overtake_cnn_latch = ConfirmedOneShot(
+            confirm_frames=overtake_confirm_frames,
+            rearm_clear_frames=overtake_rearm_frames,
+        )
+        # Include one process-unique prefix so a restarted perception node can
+        # never reuse an event id still remembered by simple_motion.
+        self._block_event_prefix = str(time.time_ns())
+        self._block_event_counter = 0
         self._cone_trigger_high = False
         self._start_r_detected = False
         self._last_route_intent = ROUTE_MAIN
         self._last_published_mode = ""
         self._last_center_message: Optional[PoseArray] = None
+        self._last_observed_mode = MODE_GENERAL
+        self._post_cone_window = PostConeHardcodeWindow(
+            window_sec=self._post_cone_hardcode_window_sec
+        )
         legacy_model_path = str(p("model_path", ""))
         legacy_model_sha = str(p("expected_model_sha256", ""))
         general_model_path = str(p("general_model_path", legacy_model_path))
@@ -252,10 +293,25 @@ class CnnPathNode(Node):
             raise ValueError(
                 "overtake_inward_margin_m is fixed to the approved 0.10 m contract"
             )
-        if not np.isclose(self._overtake_x_max, 1.40, rtol=0.0, atol=1e-9):
+        if (
+            not np.isfinite(self._overtake_x_min)
+            or not np.isfinite(self._overtake_x_max)
+            or self._overtake_x_min < 0.0
+            or self._overtake_x_max <= self._overtake_x_min
+            or self._overtake_x_max > 3.0
+        ):
             raise ValueError(
-                "overtake_x_max_m is fixed to the current 1.40 m forward line"
+                "overtake x window must satisfy 0 <= min < max <= 3.0 m"
             )
+        if not np.isfinite(self._obstacle_lane_deadband) or not (
+            0.02 <= self._obstacle_lane_deadband <= 0.50
+        ):
+            raise ValueError("obstacle_lane_deadband_m must be within 0.02..0.50 m")
+        if (
+            not np.isfinite(self._post_cone_hardcode_window_sec)
+            or self._post_cone_hardcode_window_sec <= 0.0
+        ):
+            raise ValueError("post_cone_hardcode_window_sec must be positive and finite")
 
         guard = PathGuardConfig(
             valid_threshold=float(p("valid_threshold", 0.50)),
@@ -307,6 +363,9 @@ class CnnPathNode(Node):
         self._race_go_pub = self.create_publisher(Bool, race_go_topic, 1)
         self._mode_pub = self.create_publisher(String, self._mode_topic, 1)
         self._cone_mode_pub = self.create_publisher(Bool, self._cone_mode_topic, 1)
+        self._overtake_block_request_pub = self.create_publisher(
+            String, self._overtake_block_request_topic, 1
+        )
         self._diag_pub = self.create_publisher(String, "/debug/cnn_path", 10)
         self._cnn_input_bev_pub = self.create_publisher(
             Image, cnn_input_bev_topic, LATEST_QOS
@@ -344,17 +403,81 @@ class CnnPathNode(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def _current_route(self) -> str:
-        mode = self._mode_controller.snapshot(self._now_sec()).mode
+        mode = self._current_mode().mode
         return ROUTE_SHORTCUT if mode == MODE_SHORTCUT else ROUTE_MAIN
 
+    def _observe_mode_snapshot(self, snapshot, *, now_sec: float) -> None:
+        """Observe every externally used mode transition in one place.
+
+        ``hardcoded_post_cone`` is armed only by CONE's natural timer expiry.
+        Its five-second deadline is calculated from the original CONE
+        deadline, not from a delayed camera callback.  An explicit reset never
+        arms the fixed-obstacle window.
+        """
+
+        previous = self._last_observed_mode
+        self._post_cone_window.observe_transition(
+            previous_mode=previous,
+            mode=snapshot.mode,
+            changed=snapshot.changed,
+            reason=snapshot.reason,
+            remaining_sec=snapshot.remaining_sec,
+            now_sec=now_sec,
+        )
+        if previous == MODE_CONE and snapshot.mode == MODE_GENERAL:
+            if snapshot.changed and snapshot.reason == "timer_expired":
+                remaining = self._post_cone_window.remaining_sec(now_sec)
+                self.get_logger().warning(
+                    "post-CONE fixed-obstacle hardcode window armed: "
+                    f"remaining={remaining:.2f}s"
+                )
+        self._last_observed_mode = snapshot.mode
+
+    def _post_cone_window_remaining(self, now_sec: Optional[float] = None) -> float:
+        now = self._now_sec() if now_sec is None else float(now_sec)
+        return self._post_cone_window.remaining_sec(now)
+
+    def _hardcode_window_active(self, now_sec: Optional[float] = None) -> bool:
+        if self._overtake_strategy == STRATEGY_HARDCODED_ALL:
+            return True
+        return self._post_cone_window_remaining(now_sec) > 0.0
+
+    def _overtake_latch_diagnostics(self) -> dict:
+        hardcode_active = self._hardcode_window_active()
+        active_latch = (
+            self._overtake_direction_latch
+            if hardcode_active
+            else self._overtake_cnn_latch
+        )
+        return {
+            "overtake_confirm_count": active_latch.positive_count,
+            "overtake_confirm_frames": active_latch.confirm_frames,
+            "overtake_trigger_armed": active_latch.armed,
+            "overtake_direction_confirm_count": (
+                self._overtake_direction_latch.positive_count
+            ),
+            "overtake_cnn_confirm_count": self._overtake_cnn_latch.positive_count,
+            "obstacle_lane_candidate": self._overtake_direction_latch.candidate,
+            "hardcode_window_active": hardcode_active,
+            "post_cone_hardcode_remaining_sec": round(
+                self._post_cone_window_remaining(), 2
+            ),
+        }
+
     def _current_mode(self):
-        snapshot = self._mode_controller.snapshot(self._now_sec())
+        now_sec = self._now_sec()
+        snapshot = self._mode_controller.snapshot(now_sec)
+        self._observe_mode_snapshot(snapshot, now_sec=now_sec)
         if snapshot.changed:
             self.get_logger().info("CNN mode timer ended: GENERAL")
         return snapshot
 
     def _publish_mode(self, snapshot=None) -> None:
-        state = snapshot or self._current_mode()
+        if snapshot is None:
+            state = self._current_mode()
+        else:
+            state = snapshot
+            self._observe_mode_snapshot(state, now_sec=self._now_sec())
         self._mode_pub.publish(String(data=state.mode))
         self._cone_mode_pub.publish(Bool(data=state.mode == MODE_CONE))
         if state.mode != self._last_published_mode:
@@ -363,6 +486,29 @@ class CnnPathNode(Node):
                 f"remaining={state.remaining_sec:.1f}s"
             )
             self._last_published_mode = state.mode
+
+    def _publish_overtake_block_request(
+        self,
+        *,
+        obstacle_lane: str,
+        lateral_offset_m: float,
+    ) -> HardcodedOvertakeRequest:
+        """Publish exactly one versioned request; never change CNN mode."""
+
+        self._block_event_counter += 1
+        request = HardcodedOvertakeRequest(
+            event_id=f"{self._block_event_prefix}-{self._block_event_counter}",
+            direction=avoidance_direction(obstacle_lane),
+            obstacle_lane=obstacle_lane,
+            lateral_offset_m=lateral_offset_m,
+        )
+        self._overtake_block_request_pub.publish(String(data=request.to_json()))
+        self.get_logger().warning(
+            "hardcoded obstacle block requested: "
+            f"event={request.event_id} obstacle={request.obstacle_lane} "
+            f"move={request.direction} offset={request.lateral_offset_m:+.3f}m"
+        )
+        return request
 
     def _publish_route_intent(self) -> None:
         route = self._current_route()
@@ -435,6 +581,9 @@ class CnnPathNode(Node):
         if update.route_changed:
             if update.route_intent == ROUTE_SHORTCUT:
                 if self._race.started and not self._race.finished:
+                    # Observe any natural timer expiry before asking the mode
+                    # controller to enter another specialized mode.
+                    self._current_mode()
                     mode = self._mode_controller.trigger(
                         MODE_SHORTCUT,
                         now_sec=now_sec,
@@ -480,6 +629,7 @@ class CnnPathNode(Node):
         self._cone_trigger_high = detected
         if not rising:
             return
+        self._current_mode()
         mode = self._mode_controller.trigger(
             MODE_CONE,
             now_sec=self._now_sec(),
@@ -651,9 +801,10 @@ class CnnPathNode(Node):
             "left_streak": self._mission.left_streak,
             "cone_trigger_raw": bool(self._cone_trigger_high),
             "start_r_detected": bool(self._start_r_detected),
-            "overtake_confirm_count": self._overtake_latch.positive_count,
-            "overtake_confirm_frames": self._overtake_latch.confirm_frames,
-            "overtake_trigger_armed": self._overtake_latch.armed,
+            "overtake_strategy": self._overtake_strategy,
+            "overtake_block_request_topic": self._overtake_block_request_topic,
+            "obstacle_lane_deadband_m": self._obstacle_lane_deadband,
+            **self._overtake_latch_diagnostics(),
             **self._race_diagnostics(),
             **extra,
         }
@@ -738,7 +889,11 @@ class CnnPathNode(Node):
             "trigger_x_min_m": self._overtake_x_min,
             "trigger_x_max_m": self._overtake_x_max,
             "trigger_inward_margin_m": self._overtake_inward_margin,
+            "strategy": self._overtake_strategy,
+            "obstacle_lane_deadband_m": self._obstacle_lane_deadband,
+            "obstacle_lane": OBSTACLE_UNKNOWN,
         }
+        block_request: Optional[HardcodedOvertakeRequest] = None
         raw_lidar_grid = points_to_grid(
             raw_lidar_points, radius_cells=self._lidar_radius
         )
@@ -751,7 +906,8 @@ class CnnPathNode(Node):
             lidar = raw_lidar_grid
             lidar_points = int(raw_lidar_points.shape[0])
             road_diag["reference"] = "not_evaluated_in_cone"
-            self._overtake_latch.observe(False)
+            self._overtake_direction_latch.observe(None)
+            self._overtake_cnn_latch.observe(False)
         elif reference is not None:
             lidar_preprocess = "outside_white_removed"
             try:
@@ -770,6 +926,7 @@ class CnnPathNode(Node):
                     trigger_min_inside_ratio=self._overtake_min_inside_ratio,
                     trigger_min_road_width_m=self._overtake_min_road_width,
                     trigger_max_road_width_m=self._overtake_max_road_width,
+                    trigger_lane_deadband_m=self._obstacle_lane_deadband,
                     cluster_gap_base_m=self._overtake_cluster_gap_base,
                     cluster_gap_per_m=self._overtake_cluster_gap_per_m,
                     max_cluster_extent_m=self._overtake_max_cluster_extent,
@@ -793,6 +950,15 @@ class CnnPathNode(Node):
                     ),
                     "reliable_boundary_rows": road.reliable_rows,
                     "removed_outside_points": road.removed_points,
+                    "trigger_cluster_centroid_x_m": (
+                        road.trigger_cluster_centroid_x_m
+                    ),
+                    "trigger_cluster_centroid_y_m": (
+                        road.trigger_cluster_centroid_y_m
+                    ),
+                    "trigger_reference_y_m": road.trigger_reference_y_m,
+                    "trigger_lateral_offset_m": road.trigger_lateral_offset_m,
+                    "trigger_side_ambiguous": road.trigger_side_ambiguous,
                 }
             )
             detected_before_start_r_suppression = bool(road.trigger_detected)
@@ -811,17 +977,68 @@ class CnnPathNode(Node):
                     "trigger_detected": effective_overtake_detected,
                 }
             )
-            # Feed the real detection state even while another mode owns the
-            # path.  Treating "mode is not GENERAL" as a clear frame would
-            # re-arm the one-shot while the same obstacle is still present,
-            # causing another 7-second window immediately after expiry.
-            overtake_event = self._overtake_latch.observe(
-                effective_overtake_detected
+            obstacle_lane = classify_obstacle_lane(
+                road.trigger_lateral_offset_m if effective_overtake_detected else None,
+                deadband_m=self._obstacle_lane_deadband,
             )
             trigger_allowed = (
                 mode_state.mode == MODE_GENERAL and not self._cone_trigger_high
             )
-            if overtake_event and trigger_allowed:
+            hardcode_window_active = self._hardcode_window_active()
+            road_diag.update(
+                {
+                    "obstacle_lane": obstacle_lane,
+                    "block_direction": (
+                        avoidance_direction(obstacle_lane)
+                        if obstacle_lane != OBSTACLE_UNKNOWN
+                        else OBSTACLE_UNKNOWN
+                    ),
+                    "block_trigger_allowed": trigger_allowed,
+                    "hardcode_window_active": hardcode_window_active,
+                    "post_cone_hardcode_remaining_sec": (
+                        self._post_cone_window_remaining()
+                    ),
+                }
+            )
+            if not detected_before_start_r_suppression:
+                lane_observation = None
+            elif (
+                effective_overtake_detected
+                and trigger_allowed
+                and hardcode_window_active
+            ):
+                lane_observation = obstacle_lane
+            else:
+                # START_R, CONE, or another specialized mode is not a genuine
+                # clear frame.  Reset a partial streak without re-arming a
+                # block against the same visible object.
+                lane_observation = OBSTACLE_UNKNOWN
+            confirmed_lane = self._overtake_direction_latch.observe(
+                lane_observation
+            )
+            cnn_overtake_event = self._overtake_cnn_latch.observe(
+                effective_overtake_detected
+            )
+            if (
+                hardcode_window_active
+                and confirmed_lane is not None
+                and trigger_allowed
+            ):
+                offset = road.trigger_lateral_offset_m
+                if offset is None:
+                    raise RuntimeError("confirmed obstacle lane has no lateral offset")
+                block_request = self._publish_overtake_block_request(
+                    obstacle_lane=confirmed_lane,
+                    lateral_offset_m=offset,
+                )
+                road_diag["block_event_id"] = block_request.event_id
+                # Hardcode execution deliberately stays GENERAL:
+                # simple_motion temporarily owns steering exclusively.
+            elif (
+                not hardcode_window_active
+                and cnn_overtake_event
+                and trigger_allowed
+            ):
                 mode_state = self._mode_controller.trigger(
                     MODE_OVERTAKE,
                     now_sec=self._now_sec(),
@@ -835,7 +1052,8 @@ class CnnPathNode(Node):
         else:
             # No trustworthy road reference yet: keep the model channel clean
             # for this first frame and never fabricate OVERTAKE evidence.
-            self._overtake_latch.observe(False)
+            self._overtake_direction_latch.observe(None)
+            self._overtake_cnn_latch.observe(False)
             road_diag["reference"] = "unavailable"
             lidar_preprocess = "outside_white_removed_no_reference"
             lidar = np.zeros((GRID_H, GRID_W), dtype=np.uint8)
@@ -898,9 +1116,13 @@ class CnnPathNode(Node):
             "road_lidar": road_diag,
             "cone_trigger_raw": bool(self._cone_trigger_high),
             "start_r_detected": bool(self._start_r_detected),
-            "overtake_confirm_count": self._overtake_latch.positive_count,
-            "overtake_confirm_frames": self._overtake_latch.confirm_frames,
-            "overtake_trigger_armed": self._overtake_latch.armed,
+            "overtake_strategy": self._overtake_strategy,
+            "overtake_block_request_topic": self._overtake_block_request_topic,
+            "obstacle_lane_deadband_m": self._obstacle_lane_deadband,
+            "block_request_event_id": (
+                block_request.event_id if block_request is not None else None
+            ),
+            **self._overtake_latch_diagnostics(),
             **self._race_diagnostics(),
             "raw_lidar_points": int(raw_lidar_points.shape[0]),
             "raw_lidar_cells": raw_lidar_cells,

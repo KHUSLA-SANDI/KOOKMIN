@@ -77,6 +77,12 @@ def test_runtime_grid_config_is_the_frozen_contract():
     assert params["overtake_inward_margin_m"] == 0.10
     assert params["overtake_x_min_m"] == 0.0
     assert params["overtake_x_max_m"] == 1.40
+    assert params["overtake_strategy"] == "hardcoded_all"
+    assert params["overtake_block_request_topic"] == (
+        "/motion/overtake_block_request"
+    )
+    assert params["obstacle_lane_deadband_m"] == 0.10
+    assert params["post_cone_hardcode_window_sec"] == 5.0
     assert params["max_abs_y_m"] >= 1.5
     assert params["max_abs_slope"] == 3.1
     assert params["max_abs_curvature"] == 12.0
@@ -155,6 +161,22 @@ def test_simple_motion_has_four_independent_profiles():
     assert config["cone_approach_topic"] == "/perception/cone_approach"
     assert config["cone_approach_speed_cmd"] == 12.0
     assert config["control_hz"] == 20.0
+    assert config["debug_hz"] == 10.0
+    assert config["overtake_strategy"] == "hardcoded_all"
+    assert config["overtake_block_request_topic"] == (
+        "/motion/overtake_block_request"
+    )
+    assert config["hardcoded_block_lane_change_speed_cmd"] == 16.0
+    assert config["hardcoded_block_pass_speed_cmd"] == 16.0
+    assert config["hardcoded_block_pass_ticks"] == 20
+    assert config["hardcoded_block_right_shift_angle_cmd"] == 60.0
+    assert config["hardcoded_block_right_shift_ticks"] == 6
+    assert config["hardcoded_block_right_counter_angle_cmd"] == -60.0
+    assert config["hardcoded_block_right_counter_ticks"] == 10
+    assert config["hardcoded_block_left_shift_angle_cmd"] == -60.0
+    assert config["hardcoded_block_left_shift_ticks"] == 7
+    assert config["hardcoded_block_left_counter_angle_cmd"] == 60.0
+    assert config["hardcoded_block_left_counter_ticks"] == 10
     assert config["path_stale_sec"] == 1.0
     assert config["verify_car_interface_source"] is True
     assert config["expected_car_interface_sha256"] == AUDITED_CAR_INTERFACE_SHA256

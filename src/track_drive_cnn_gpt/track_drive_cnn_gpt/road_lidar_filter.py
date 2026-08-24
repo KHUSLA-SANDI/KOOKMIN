@@ -33,6 +33,11 @@ class RoadLidarResult:
     trigger_detected: bool
     trigger_cluster_points: int
     trigger_inside_points: int
+    trigger_cluster_centroid_x_m: float | None
+    trigger_cluster_centroid_y_m: float | None
+    trigger_reference_y_m: float | None
+    trigger_lateral_offset_m: float | None
+    trigger_side_ambiguous: bool
     reliable_rows: int
     removed_points: int
 
@@ -203,6 +208,7 @@ def filter_and_detect_in_road(
     trigger_min_inside_ratio: float = 0.50,
     trigger_min_road_width_m: float = 0.35,
     trigger_max_road_width_m: float = 1.50,
+    trigger_lane_deadband_m: float = 0.10,
     cluster_gap_base_m: float = 0.15,
     cluster_gap_per_m: float = 0.03,
     max_cluster_extent_m: float = 0.90,
@@ -222,6 +228,7 @@ def filter_and_detect_in_road(
         trigger_min_inside_ratio,
         trigger_min_road_width_m,
         trigger_max_road_width_m,
+        trigger_lane_deadband_m,
         cluster_gap_base_m,
         cluster_gap_per_m,
         max_cluster_extent_m,
@@ -232,6 +239,8 @@ def filter_and_detect_in_road(
         raise ValueError("trigger_min_inside_ratio must be within [0, 1]")
     if trigger_x_min_m < 0.0 or trigger_x_max_m <= trigger_x_min_m:
         raise ValueError("trigger x window must satisfy 0 <= min < max")
+    if trigger_lane_deadband_m <= 0.0:
+        raise ValueError("trigger_lane_deadband_m must be positive")
     if int(trigger_min_points) < 1:
         raise ValueError("trigger_min_points must be positive")
 
@@ -281,6 +290,18 @@ def filter_and_detect_in_road(
     best_cluster = 0
     best_inside = 0
     detected = False
+    selected_centroid_x: float | None = None
+    selected_centroid_y: float | None = None
+    selected_reference_y: float | None = None
+    selected_lateral_offset: float | None = None
+    selected_cluster_points = 0
+    selected_inside_points = 0
+    qualifying_offsets: list[float] = []
+    reference_by_row = _path_reference_by_row(reference_x, reference_y)
+    # Choose one deterministic qualifying cluster.  More strict in-road
+    # points win; ties prefer the closer cluster.  This is also the cluster
+    # used to classify lane 1/2 for the production hardcoded block.
+    selected_rank: tuple[int, float, float] | None = None
     for cluster in _clusters(
         front_values,
         gap_base_m=cluster_gap_base_m,
@@ -292,6 +313,7 @@ def filter_and_detect_in_road(
         if extent > max_cluster_extent_m:
             continue
         strict = 0
+        strict_offsets: list[float] = []
         for x, y in cluster:
             row = int(math.floor((X_MAX - float(x)) / RESOLUTION))
             if not 0 <= row < GRID_H:
@@ -303,19 +325,58 @@ def filter_and_detect_in_road(
                 and float(y) >= right[row] + trigger_inward_margin_m
             ):
                 strict += 1
+                center_y = reference_by_row[row]
+                if np.isfinite(center_y):
+                    strict_offsets.append(float(y) - float(center_y))
         best_cluster = max(best_cluster, int(cluster.shape[0]))
         best_inside = max(best_inside, strict)
         ratio = strict / float(cluster.shape[0])
         if strict >= int(trigger_min_points) and ratio >= trigger_min_inside_ratio:
+            centroid = np.median(cluster, axis=0)
+            offset = (
+                float(np.median(np.asarray(strict_offsets, dtype=np.float64)))
+                if strict_offsets
+                else None
+            )
+            reference_y = (
+                float(centroid[1]) - offset if offset is not None else None
+            )
+            rank = (strict, ratio, -float(centroid[0]))
+            if selected_rank is None or rank > selected_rank:
+                selected_rank = rank
+                selected_centroid_x = float(centroid[0])
+                selected_centroid_y = float(centroid[1])
+                selected_reference_y = reference_y
+                selected_lateral_offset = offset
+                selected_cluster_points = int(cluster.shape[0])
+                selected_inside_points = int(strict)
+            if offset is not None:
+                qualifying_offsets.append(offset)
             detected = True
-            break
+
+    side_ambiguous = bool(
+        any(value >= trigger_lane_deadband_m for value in qualifying_offsets)
+        and any(value <= -trigger_lane_deadband_m for value in qualifying_offsets)
+    )
+    if side_ambiguous:
+        # Detection remains true for the legacy CNN fallback, but no
+        # directional hardcoded block may be selected from conflicting sides.
+        selected_centroid_x = None
+        selected_centroid_y = None
+        selected_reference_y = None
+        selected_lateral_offset = None
 
     reliable = int(np.count_nonzero(np.isfinite(left) & np.isfinite(right)))
     return RoadLidarResult(
         filtered_points=filtered,
         trigger_detected=detected,
-        trigger_cluster_points=best_cluster,
-        trigger_inside_points=best_inside,
+        trigger_cluster_points=(selected_cluster_points if detected else best_cluster),
+        trigger_inside_points=(selected_inside_points if detected else best_inside),
+        trigger_cluster_centroid_x_m=selected_centroid_x,
+        trigger_cluster_centroid_y_m=selected_centroid_y,
+        trigger_reference_y_m=selected_reference_y,
+        trigger_lateral_offset_m=selected_lateral_offset,
+        trigger_side_ambiguous=side_ambiguous,
         reliable_rows=reliable,
         removed_points=int(points.shape[0] - filtered.shape[0]),
     )

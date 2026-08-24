@@ -197,6 +197,12 @@ class LivePipelineViewerNode(Node):
         self._road_trigger_x_max_m = 1.40
         self._road_trigger_inward_margin_m = 0.10
         self._road_reference = "unavailable"
+        self._overtake_strategy = "cnn"
+        self._obstacle_lane = "UNKNOWN"
+        self._obstacle_lateral_offset_m: float | None = None
+        self._obstacle_side_ambiguous = False
+        self._hardcode_window_active = False
+        self._post_cone_hardcode_remaining_sec = 0.0
         self._overtake_confirm_count = 0
         self._overtake_confirm_frames = 2
         self._overtake_trigger_armed = True
@@ -576,6 +582,25 @@ class LivePipelineViewerNode(Node):
                 road.get("trigger_min_points", self._overtake_min_raw_points)
             )
             self._road_reference = str(road.get("reference", "unavailable"))
+            self._overtake_strategy = str(
+                payload.get("overtake_strategy", self._overtake_strategy)
+            )
+            self._obstacle_lane = str(
+                road.get("obstacle_lane", self._obstacle_lane)
+            ).strip().upper()
+            lateral_offset = road.get("trigger_lateral_offset_m")
+            self._obstacle_lateral_offset_m = (
+                float(lateral_offset) if lateral_offset is not None else None
+            )
+            self._obstacle_side_ambiguous = bool(
+                road.get("trigger_side_ambiguous", False)
+            )
+            self._hardcode_window_active = bool(
+                payload.get("hardcode_window_active", False)
+            )
+            self._post_cone_hardcode_remaining_sec = float(
+                payload.get("post_cone_hardcode_remaining_sec", 0.0)
+            )
             self._overtake_confirm_count = next_overtake_count
             self._overtake_confirm_frames = int(
                 payload.get("overtake_confirm_frames", 2)
@@ -629,13 +654,24 @@ class LivePipelineViewerNode(Node):
         text = str(message.data).strip() or "motion debug empty"
         try:
             payload = json.loads(text)
-            text = (
-                f"MOTION profile={payload.get('profile', '?')} "
-                f"lookahead={float(payload.get('lookahead_m', 0.0)):.2f}m "
-                f"gain={float(payload.get('steer_gain', 0.0)):.2f} "
-                f"alpha={float(payload.get('steer_smooth_alpha', 0.0)):.2f} "
-                f"speed={float(payload.get('requested_speed', 0.0)):.1f} "
-                f"drive={payload.get('drive', False)} reason={payload.get('reason', '?')}"
+            block_active = bool(payload.get("hardcoded_block_active", False))
+            block_prefix = (
+                f"BLOCK {payload.get('overtake_strategy', '?')} "
+                f"active={int(block_active)} "
+                f"{payload.get('hardcoded_block_direction', 'NONE')} "
+                f"{payload.get('hardcoded_block_phase', 'IDLE')} "
+                f"{int(payload.get('hardcoded_block_phase_tick', 0))}/"
+                f"{int(payload.get('hardcoded_block_phase_ticks', 0))} "
+                f"total={int(payload.get('hardcoded_block_total_tick', 0))}/"
+                f"{int(payload.get('hardcoded_block_total_ticks', 0))} | "
+            )
+            text = block_prefix + (
+                f"MOTION {payload.get('profile', '?')} "
+                f"L={float(payload.get('lookahead_m', 0.0)):.2f} "
+                f"G={float(payload.get('steer_gain', 0.0)):.2f} "
+                f"V={float(payload.get('requested_speed', 0.0)):.1f} "
+                f"drive={int(bool(payload.get('drive', False)))} "
+                f"{payload.get('reason', '?')}"
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -832,6 +868,14 @@ class LivePipelineViewerNode(Node):
             road_trigger_x_max_m = self._road_trigger_x_max_m
             road_trigger_inward_margin_m = self._road_trigger_inward_margin_m
             road_reference = self._road_reference
+            overtake_strategy = self._overtake_strategy
+            obstacle_lane = self._obstacle_lane
+            obstacle_lateral_offset_m = self._obstacle_lateral_offset_m
+            obstacle_side_ambiguous = self._obstacle_side_ambiguous
+            hardcode_window_active = self._hardcode_window_active
+            post_cone_hardcode_remaining_sec = (
+                self._post_cone_hardcode_remaining_sec
+            )
             overtake_min_raw_points = self._overtake_min_raw_points
             overtake_confirm_count = self._overtake_confirm_count
             overtake_confirm_frames = self._overtake_confirm_frames
@@ -1226,6 +1270,26 @@ class LivePipelineViewerNode(Node):
             overtake_color if overtake_active else INACTIVE_TEXT_BGR,
             scale=0.50,
             thickness=2 if overtake_active else 1,
+            gap=9,
+        )
+        offset_text = (
+            f"{obstacle_lateral_offset_m:+.3f}m"
+            if obstacle_lateral_offset_m is not None
+            else "--"
+        )
+        x = self._put_segment(
+            canvas,
+            (
+                f"STRAT={overtake_strategy} LANE={obstacle_lane} "
+                f"OFF={offset_text} AMB={int(obstacle_side_ambiguous)} "
+                f"WIN={int(hardcode_window_active)}:"
+                f"{post_cone_hardcode_remaining_sec:.1f}s"
+            ),
+            x,
+            84,
+            overtake_color if overtake_active else INACTIVE_TEXT_BGR,
+            scale=0.43,
+            thickness=1,
             gap=9,
         )
         if overtake_suppressed_by_start_r:

@@ -17,6 +17,7 @@ stops propulsion.
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import inspect
 import json
@@ -27,16 +28,28 @@ from typing import Any, Optional
 import numpy as np
 
 from .cnn_modes import MODE_CONE, MODE_GENERAL, MODE_OVERTAKE, MODE_SHORTCUT, MODES
+from .hardcoded_overtake import (
+    OVERTAKE_STRATEGIES,
+    STRATEGY_HARDCODED_ALL,
+    HardcodedOvertakeRequest,
+)
 from .motion_path_adapter import (
     prepare_ego_relative_path,
     stamp_to_ns,
     validate_source_stamp_ns,
 )
+from .overtake_block import (
+    DIRECTION_LEFT,
+    DIRECTION_RIGHT,
+    PHASE_IDLE,
+    HardcodedOvertakeBlock,
+    OvertakePulseProfile,
+)
 
 
 ANGLE_MIN = -100.0
 ANGLE_MAX = 100.0
-DEBUG_HZ = 2.0
+DEBUG_HZ = 10.0
 AUDITED_CAR_INTERFACE_SHA256 = (
     "595628d4c08bed8ddc59ad7e53bd5393084256f74b80815994544f957935d9f8"
 )
@@ -276,6 +289,7 @@ if rclpy is not None:
             p = self._parameter
 
             self._control_hz = float(p("control_hz", 20.0))
+            self._debug_hz = float(p("debug_hz", DEBUG_HZ))
             general = {
                 "lookahead_m": float(p("lookahead_m", 1.0)),
                 "steer_gain": float(p("steer_gain", 0.45)),
@@ -314,6 +328,55 @@ if rclpy is not None:
             self._cone_approach_speed_cmd = float(
                 p("cone_approach_speed_cmd", 8.0)
             )
+            self._overtake_strategy = str(
+                p("overtake_strategy", STRATEGY_HARDCODED_ALL)
+            ).strip().lower()
+            if self._overtake_strategy not in OVERTAKE_STRATEGIES:
+                raise ValueError(
+                    "overtake_strategy must be hardcoded_all or hardcoded_post_cone"
+                )
+            self._overtake_block_request_topic = str(
+                p("overtake_block_request_topic", "/motion/overtake_block_request")
+            )
+            block_lane_change_speed = float(
+                p("hardcoded_block_lane_change_speed_cmd", 16.0)
+            )
+            block_pass_speed = float(p("hardcoded_block_pass_speed_cmd", 16.0))
+            block_pass_ticks = int(p("hardcoded_block_pass_ticks", 20))
+            self._block_profiles = {
+                DIRECTION_RIGHT: OvertakePulseProfile(
+                    direction=DIRECTION_RIGHT,
+                    shift_angle_cmd=float(
+                        p("hardcoded_block_right_shift_angle_cmd", 60.0)
+                    ),
+                    shift_ticks=int(p("hardcoded_block_right_shift_ticks", 6)),
+                    counter_angle_cmd=float(
+                        p("hardcoded_block_right_counter_angle_cmd", -60.0)
+                    ),
+                    counter_ticks=int(
+                        p("hardcoded_block_right_counter_ticks", 10)
+                    ),
+                    lane_change_speed_cmd=block_lane_change_speed,
+                    pass_speed_cmd=block_pass_speed,
+                    pass_ticks=block_pass_ticks,
+                ),
+                DIRECTION_LEFT: OvertakePulseProfile(
+                    direction=DIRECTION_LEFT,
+                    shift_angle_cmd=float(
+                        p("hardcoded_block_left_shift_angle_cmd", -60.0)
+                    ),
+                    shift_ticks=int(p("hardcoded_block_left_shift_ticks", 7)),
+                    counter_angle_cmd=float(
+                        p("hardcoded_block_left_counter_angle_cmd", 60.0)
+                    ),
+                    counter_ticks=int(
+                        p("hardcoded_block_left_counter_ticks", 10)
+                    ),
+                    lane_change_speed_cmd=block_lane_change_speed,
+                    pass_speed_cmd=block_pass_speed,
+                    pass_ticks=block_pass_ticks,
+                ),
+            }
             self._startup_speed_cmd = float(p("startup_speed_cmd", 5.0))
             self._startup_hold_sec = float(p("startup_hold_sec", 1.0))
             self._slew_speed_up_per_tick = float(
@@ -337,6 +400,12 @@ if rclpy is not None:
 
             if not math.isfinite(self._control_hz) or self._control_hz <= 0.0:
                 raise ValueError("control_hz must be positive and finite")
+            if (
+                not math.isfinite(self._debug_hz)
+                or self._debug_hz <= 0.0
+                or self._debug_hz > self._control_hz
+            ):
+                raise ValueError("debug_hz must be within 0..control_hz")
             for mode, profile in self._profiles.items():
                 lookahead = profile["lookahead_m"]
                 if not 0.3 <= lookahead <= 3.0:
@@ -387,6 +456,19 @@ if rclpy is not None:
             self._angle_cmd = 0.0
             self._cnn_mode = MODE_GENERAL
             self._cone_approach_active = False
+            self._overtake_block = HardcodedOvertakeBlock()
+            self._block_pending: Optional[HardcodedOvertakeRequest] = None
+            self._block_seen_ids: set[str] = set()
+            self._block_seen_order: deque[str] = deque()
+            self._block_event_id = ""
+            self._block_direction = "NONE"
+            self._block_obstacle_lane = "NONE"
+            self._block_phase = PHASE_IDLE
+            self._block_phase_tick = 0
+            self._block_phase_ticks = 0
+            self._block_total_tick = 0
+            self._block_total_ticks = 0
+            self._block_cancel_reason = ""
             self._debug: dict[str, Any] = {
                 "drive": False,
                 "reason": "startup",
@@ -402,6 +484,12 @@ if rclpy is not None:
             self.create_subscription(
                 Bool, self._cone_approach_topic, self._on_cone_approach, 10
             )
+            self.create_subscription(
+                String,
+                self._overtake_block_request_topic,
+                self._on_overtake_block_request,
+                10,
+            )
             self._motor_pub = self.create_publisher(
                 Float32MultiArray, "/xycar_motor", 10
             )
@@ -409,7 +497,7 @@ if rclpy is not None:
                 String, "/debug/arbitration", 10
             )
             self.create_timer(1.0 / self._control_hz, self._tick)
-            self.create_timer(1.0 / DEBUG_HZ, self._tick_debug)
+            self.create_timer(1.0 / self._debug_hz, self._tick_debug)
             summary = " ".join(
                 f"{mode}=({profile['lookahead_m']:.2f}m,{profile['steer_gain']:.3f},"
                 f"{profile['steer_smooth_alpha']:.2f},speed={profile['speed_cmd']:.1f})"
@@ -426,6 +514,17 @@ if rclpy is not None:
                 f"{self._startup_speed_cmd:.1f} hold={self._startup_hold_sec:.1f}s, "
                 f"up={self._slew_speed_up_per_tick:.2f}/tick, "
                 f"down={self._slew_speed_down_per_tick:.2f}/tick, STOP=immediate"
+            )
+            block_summary = " ".join(
+                f"{direction}=({profile.shift_angle_cmd:+.0f}x{profile.shift_ticks},"
+                f"{profile.counter_angle_cmd:+.0f}x{profile.counter_ticks},"
+                f"straightx{profile.pass_ticks})"
+                for direction, profile in self._block_profiles.items()
+            )
+            self.get_logger().info(
+                "hardcoded obstacle strategy ready: "
+                f"immediate-next-tick speed={block_lane_change_speed:.1f} "
+                f"{block_summary}"
             )
 
         def _parameter(self, name: str, default: Any) -> Any:
@@ -506,6 +605,8 @@ if rclpy is not None:
             if requested != self._cnn_mode:
                 self._cnn_mode = requested
                 self.get_logger().info(f"simple motion profile: {self._cnn_mode}")
+                if requested == MODE_CONE:
+                    self._cancel_hardcoded_block("cone_mode")
 
         def _on_cone_approach(self, message: Bool) -> None:
             active = bool(message.data)
@@ -515,6 +616,78 @@ if rclpy is not None:
                     "START_R approach speed limit: "
                     + ("ACTIVE" if active else "released")
                 )
+
+        def _remember_block_event(self, event_id: str) -> bool:
+            """Return False for a duplicate while keeping bounded history."""
+
+            if event_id in self._block_seen_ids:
+                return False
+            self._block_seen_ids.add(event_id)
+            self._block_seen_order.append(event_id)
+            while len(self._block_seen_order) > 64:
+                expired = self._block_seen_order.popleft()
+                self._block_seen_ids.discard(expired)
+            return True
+
+        def _on_overtake_block_request(self, message: String) -> None:
+            try:
+                request = HardcodedOvertakeRequest.from_json(message.data)
+            except ValueError as exc:
+                self.get_logger().warning(
+                    f"rejected hardcoded obstacle request: {exc}",
+                    throttle_duration_sec=1.0,
+                )
+                return
+            if not self._remember_block_event(request.event_id):
+                self.get_logger().info(
+                    f"ignored duplicate hardcoded obstacle event {request.event_id}"
+                )
+                return
+            if (
+                self._block_pending is not None
+                or self._overtake_block.active
+                or self._cnn_mode == MODE_CONE
+            ):
+                self.get_logger().warning(
+                    "ignored hardcoded obstacle reentry: "
+                    f"event={request.event_id} phase={self._block_phase} "
+                    f"mode={self._cnn_mode}"
+                )
+                return
+            self._block_pending = request
+            self._block_event_id = request.event_id
+            self._block_direction = request.direction
+            self._block_obstacle_lane = request.obstacle_lane
+            self._block_phase = "QUEUED"
+            self._block_phase_tick = 0
+            self._block_phase_ticks = 0
+            self._block_total_tick = 0
+            self._block_total_ticks = self._block_profiles[
+                request.direction
+            ].shift_ticks + self._block_profiles[
+                request.direction
+            ].counter_ticks + self._block_profiles[request.direction].pass_ticks
+            self._block_cancel_reason = ""
+            self.get_logger().warning(
+                "accepted hardcoded obstacle event: "
+                f"{request.event_id} obstacle={request.obstacle_lane} "
+                f"move={request.direction}"
+            )
+
+        def _cancel_hardcoded_block(self, reason: str) -> None:
+            if self._block_pending is None and not self._overtake_block.active:
+                return
+            self._block_pending = None
+            self._overtake_block.cancel()
+            self._block_phase = "CANCELLED"
+            self._block_phase_tick = 0
+            self._block_phase_ticks = 0
+            self._block_total_tick = 0
+            self._block_total_ticks = 0
+            self._block_cancel_reason = str(reason)
+            self.get_logger().warning(
+                f"hardcoded obstacle block cancelled: {reason}"
+            )
 
         def _fresh_path(self, now_ns: int) -> bool:
             if self._path_x is None or self._path_y is None:
@@ -563,7 +736,63 @@ if rclpy is not None:
             target_x = None
             target_y = None
             reason = "ok"
-            if drive:
+            block_command_published = False
+            block_present = bool(
+                self._block_pending is not None or self._overtake_block.active
+            )
+            if block_present and (not drive or profile == MODE_CONE):
+                self._cancel_hardcoded_block(
+                    "cone_mode" if profile == MODE_CONE else "drive_stop"
+                )
+                block_present = False
+
+            if drive and block_present:
+                # Exclusive block ownership: path callbacks continue caching,
+                # but path steering and the IIR are bypassed.  CarInterface is
+                # still called exactly once below, so measured calibration,
+                # clamps, and steering slew remain active.
+                target_x = None
+                target_y = None
+                if self._block_pending is not None:
+                    request = self._block_pending
+                    self._block_pending = None
+                    self._overtake_block.start(
+                        self._block_profiles[request.direction]
+                    )
+                    block_command = self._overtake_block.step()
+                    block_command_published = True
+                    self._angle_cmd = block_command.angle_cmd
+                    raw_angle = block_command.angle_cmd
+                    requested_speed = block_command.speed_cmd
+                    target_speed = min(speed_cap, requested_speed)
+                    self._block_phase = block_command.phase
+                    self._block_phase_tick = block_command.phase_tick
+                    self._block_phase_ticks = block_command.phase_ticks
+                    self._block_total_tick = block_command.total_tick
+                    self._block_total_ticks = block_command.total_ticks
+                    reason = f"hardcoded_block_{block_command.phase.lower()}"
+                else:
+                    block_command = self._overtake_block.step()
+                    block_command_published = True
+                    self._angle_cmd = block_command.angle_cmd
+                    raw_angle = block_command.angle_cmd
+                    requested_speed = block_command.speed_cmd
+                    target_speed = min(speed_cap, requested_speed)
+                    self._block_phase = block_command.phase
+                    self._block_phase_tick = block_command.phase_tick
+                    self._block_phase_ticks = block_command.phase_ticks
+                    self._block_total_tick = block_command.total_tick
+                    self._block_total_ticks = block_command.total_ticks
+                    reason = f"hardcoded_block_{block_command.phase.lower()}"
+            elif drive:
+                # The preceding final PASS publish kept PASS N/N in that
+                # tick's debug payload.  Only this following path tick returns
+                # the stable state to IDLE.
+                self._block_phase = PHASE_IDLE
+                self._block_phase_tick = 0
+                self._block_phase_ticks = 0
+                self._block_total_tick = 0
+                self._block_total_ticks = 0
                 # /drive_cmd remains the global ceiling and explicit STOP
                 # watchdog; the active motion profile owns requested speed.
                 target_speed = min(speed_cap, requested_speed)
@@ -647,6 +876,22 @@ if rclpy is not None:
                 "cone_approach_active": self._cone_approach_active,
                 "cone_approach_speed_limited": approach_speed_limited,
                 "cone_approach_speed_cmd": self._cone_approach_speed_cmd,
+                "overtake_strategy": self._overtake_strategy,
+                "hardcoded_block_active": bool(
+                    self._block_pending is not None
+                    or self._overtake_block.active
+                    or block_command_published
+                ),
+                "hardcoded_block_queued": self._block_pending is not None,
+                "hardcoded_block_event_id": self._block_event_id,
+                "hardcoded_block_direction": self._block_direction,
+                "hardcoded_block_obstacle_lane": self._block_obstacle_lane,
+                "hardcoded_block_phase": self._block_phase,
+                "hardcoded_block_phase_tick": self._block_phase_tick,
+                "hardcoded_block_phase_ticks": self._block_phase_ticks,
+                "hardcoded_block_total_tick": self._block_total_tick,
+                "hardcoded_block_total_ticks": self._block_total_ticks,
+                "hardcoded_block_cancel_reason": self._block_cancel_reason,
             }
 
         def _tick_debug(self) -> None:

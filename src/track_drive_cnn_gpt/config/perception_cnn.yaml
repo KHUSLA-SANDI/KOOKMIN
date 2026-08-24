@@ -77,6 +77,16 @@ cnn_path_node:
     shortcut_hold_sec: 13.0          # SHORTCUT 유지시간
     overtake_hold_sec: 3.0           # OVERTAKE 단일 프로필 유지시간
     cone_hold_sec: 10.0              # CONE 유지시간(위 exit_hold와 다름)
+
+    # ---------------- V3/V4 장애물 실행 전략 ---------------------------
+    # hardcoded_all: 모든 유효 장애물을 차선별 고정 조향 블록으로 회피(V3)
+    # hardcoded_post_cone: CONE 자연 종료 뒤 5초만 고정 블록, 그 밖은 CNN(V4)
+    overtake_strategy: "hardcoded_all"
+    overtake_block_request_topic: "/motion/overtake_block_request"
+    # yellow/mid 기준 lateral offset 절댓값이 이보다 작으면 좌/우 UNKNOWN.
+    obstacle_lane_deadband_m: 0.10
+    # CONE 타이머의 실제 만료시각부터 계산. route reset은 이 창을 켜지 않음.
+    post_cone_hardcode_window_sec: 5.0
     left_confirm_window_sec: 1.5     # 이 시간 안에 LEFT 2회 필요
     left_rearm_absent_frames: 3      # LEFT 재무장에 필요한 미검출 프레임
 
@@ -130,12 +140,12 @@ cnn_path_node:
     # [현장 수정 D] 도로 안 장애물 -> OVERTAKE trigger
     # 우선 조정값: min_raw_points, min_inside_ratio, confirm_frames.
     # 못 잡으면 앞의 두 값을 낮추고, 잡음에도 켜지면 높인다.
-    # inward_margin=0.10m와 x_max=1.40m는 현재 실차 계약이다.
+    # inward_margin=0.10m는 고정 계약. x_max=1.40m는 현재 초기값이며 YAML 튜닝 가능.
     # =====================================================================
     overtake_inward_margin_m: 0.10              # 흰선에서 도로 안쪽 여백(m), 고정
     overtake_white_guard_m: 0.05                # 흰선 반사점 제외 여백(m)
     overtake_x_min_m: 0.0                       # 장애물 검사 시작 전방거리(m)
-    overtake_x_max_m: 1.40                      # 장애물 검사 끝 전방거리(m), 고정
+    overtake_x_max_m: 1.40                      # 장애물 검사 끝 전방거리(m), YAML 튜닝 가능(<=3m)
     overtake_min_raw_points: 3                  # trigger 최소 cluster 점 개수
     overtake_min_inside_ratio: 0.50             # cluster 중 도로 안 점 최소 비율
     overtake_min_road_width_m: 0.35             # 유효 도로 최소 폭(m)
